@@ -49,7 +49,7 @@ func main() {
 	httpClient := &http.Client{Transport: tr}
 	client := api.NewClient(cfg.APIURL, cfg.DefaultAgent).WithHTTPClient(httpClient)
 
-	p := tea.NewProgram(tui.New(client, cfg), tea.WithAltScreen(), tea.WithMouseCellMotion())
+	p := tea.NewProgram(tui.New(client, cfg), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "monya: %v\n", err)
 		os.Exit(1)

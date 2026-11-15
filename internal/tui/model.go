@@ -3,10 +3,12 @@ package tui
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -47,7 +49,8 @@ type (
 		output string
 		err    error
 	}
-	commandTimeoutMsg struct{}
+	commandTimeoutMsg  struct{}
+	clearCopyStatusMsg struct{ token int }
 )
 
 type sessionItem struct{ agent api.Agent }
@@ -91,6 +94,10 @@ type Model struct {
 	pendingCmd      string
 	commandCancel   context.CancelFunc
 	commandTimedOut bool
+
+	// Clipboard feedback
+	copyStatus      string
+	copyStatusToken int
 }
 
 func New(client *api.Client, cfg *config.Config) *Model {
@@ -238,6 +245,98 @@ func renderMarkdown(content string) string {
 	return r
 }
 
+// extractCodeBlocks returns the contents of all fenced code blocks in md.
+func extractCodeBlocks(md string) []string {
+	var blocks []string
+	var cur []string
+	inBlock := false
+	for _, ln := range strings.Split(md, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(ln), "```") {
+			if inBlock {
+				blocks = append(blocks, strings.Join(cur, "\n"))
+				cur = nil
+				inBlock = false
+			} else {
+				inBlock = true
+				cur = nil
+			}
+			continue
+		}
+		if inBlock {
+			cur = append(cur, ln)
+		}
+	}
+	return blocks
+}
+
+// copyToClipboard writes text to the system clipboard. It emits an OSC 52
+// escape sequence (supported by many modern terminals) and also tries
+// wl-copy/xclip/xsel/pbcopy when available.
+func copyToClipboard(text string) error {
+	enc := base64.StdEncoding.EncodeToString([]byte(text))
+	fmt.Fprintf(os.Stdout, "\x1b]52;c;%s\x07", enc)
+
+	for _, c := range [][]string{
+		{"wl-copy"},
+		{"xclip", "-selection", "clipboard"},
+		{"xsel", "--clipboard", "--input"},
+		{"pbcopy"},
+	} {
+		path, err := exec.LookPath(c[0])
+		if err != nil {
+			continue
+		}
+		cmd := exec.Command(path, c[1:]...)
+		cmd.Stdin = strings.NewReader(text)
+		if err := cmd.Run(); err == nil {
+			return nil
+		}
+	}
+	return nil
+}
+
+// setCopyStatus shows a transient status line in the chat view.
+func (m *Model) setCopyStatus(s string) tea.Cmd {
+	m.copyStatus = s
+	m.copyStatusToken++
+	tok := m.copyStatusToken
+	return tea.Tick(3*time.Second, func(time.Time) tea.Msg {
+		return clearCopyStatusMsg{token: tok}
+	})
+}
+
+// copyLastAnswer copies the most recent assistant message to the clipboard.
+func (m *Model) copyLastAnswer() tea.Cmd {
+	for i := len(m.history) - 1; i >= 0; i-- {
+		if m.history[i].Role == "assistant" && m.history[i].Content != "" {
+			if err := copyToClipboard(m.history[i].Content); err != nil {
+				return m.setCopyStatus("Copy failed: " + err.Error())
+			}
+			return m.setCopyStatus("Last answer copied to clipboard")
+		}
+	}
+	return m.setCopyStatus("Nothing to copy")
+}
+
+// copyLastCode copies the last fenced code block of the newest assistant
+// message that contains one.
+func (m *Model) copyLastCode() tea.Cmd {
+	for i := len(m.history) - 1; i >= 0; i-- {
+		if m.history[i].Role != "assistant" {
+			continue
+		}
+		blocks := extractCodeBlocks(m.history[i].Content)
+		if len(blocks) == 0 {
+			continue
+		}
+		if err := copyToClipboard(blocks[len(blocks)-1]); err != nil {
+			return m.setCopyStatus("Copy failed: " + err.Error())
+		}
+		return m.setCopyStatus("Last code block copied to clipboard")
+	}
+	return m.setCopyStatus("No code blocks to copy")
+}
+
 func (m *Model) updateViewport() {
 	var b strings.Builder
 
@@ -317,6 +416,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
 		return m, cmd
+
+	case clearCopyStatusMsg:
+		if msg.token == m.copyStatusToken {
+			m.copyStatus = ""
+		}
+		return m, nil
 
 	case streamStartedMsg:
 		m.stream = msg.stream
@@ -471,6 +576,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, m.startStream()
 				}
 				return m, nil
+			}
+
+			if msg.String() == "ctrl+y" {
+				return m, m.copyLastAnswer()
+			}
+			if msg.String() == "ctrl+b" {
+				return m, m.copyLastCode()
 			}
 
 			switch msg.String() {
@@ -677,7 +789,10 @@ func (m *Model) viewChat() string {
 		b.WriteString(fmt.Sprintf("%s Streaming... [esc] to cancel", m.spinner.View()))
 	} else {
 		b.WriteString(lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("238")).Width(m.viewport.Width).Render(m.textarea.View()))
-		b.WriteString("\n" + helpStyle.Render("[enter] send  [ctrl+j] newline  [pgup/pgdown] scroll  [esc] back"))
+		b.WriteString("\n" + helpStyle.Render("[enter] send  [ctrl+j] newline  [ctrl+y] copy answer  [ctrl+b] copy code  [pgup/pgdown] scroll  [esc] back"))
+	}
+	if m.copyStatus != "" {
+		b.WriteString("\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Render("✓ "+m.copyStatus))
 	}
 	return b.String()
 }
