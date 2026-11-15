@@ -1,0 +1,15 @@
+# binaries
+/monya
+/bin/
+*.exe
+
+# tests
+*.test
+*.out
+
+# local config
+.monya.toml
+
+# editor
+.vscode/
+.idea/
