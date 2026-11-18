@@ -4,11 +4,13 @@ import "encoding/json"
 
 // ChatRequest is the body for POST /v1/chat/completions.
 type ChatRequest struct {
-	Model    string    `json:"model"`
-	Messages []Message `json:"messages"`
-	Stream   bool      `json:"stream"`
-	User     string    `json:"user,omitempty"`
-	Tools    []Tool    `json:"tools,omitempty"`
+	Model              string         `json:"model"`
+	Messages           []Message      `json:"messages"`
+	Stream             bool           `json:"stream"`
+	MaxTokens          int            `json:"max_tokens,omitempty"`
+	User               string         `json:"user,omitempty"`
+	Tools              []Tool         `json:"tools,omitempty"`
+	ChatTemplateKwargs map[string]any `json:"chat_template_kwargs,omitempty"`
 }
 
 // Message is one item of the conversation history.

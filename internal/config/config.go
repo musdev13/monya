@@ -25,8 +25,8 @@ type Config struct {
 // Default returns the built-in configuration.
 func Default() *Config {
 	return &Config{
-		APIURL:       "http://127.0.0.1:9655",
-		DefaultModel: "deepseek-reasoner-search",
+		APIURL:       "http://127.0.0.1:8080",
+		DefaultModel: "/home/idk/Models/Qwen3.5-4B-Q4_K_M.gguf",
 		DefaultAgent: "dev-agent",
 		RateLimit: RateLimit{
 			RequestsPerSecond: 0.5, // 1 request per 2 seconds by default

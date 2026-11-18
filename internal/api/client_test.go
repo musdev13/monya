@@ -73,6 +73,67 @@ func TestChatCompletion_APIError(t *testing.T) {
 	}
 }
 
+func TestContextSizeAndCountChatTokens(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/props":
+			io.WriteString(w, `{"default_generation_settings":{"n_ctx":4096}}`)
+		case "/apply-template":
+			var body struct {
+				Messages           []Message      `json:"messages"`
+				Tools              []Tool         `json:"tools"`
+				ChatTemplateKwargs map[string]any `json:"chat_template_kwargs"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode template request: %v", err)
+			}
+			if len(body.Messages) != 1 || len(body.Tools) != 1 {
+				t.Fatalf("template request omitted messages or tools: %+v", body)
+			}
+			if body.ChatTemplateKwargs["enable_thinking"] != false {
+				t.Fatalf("thinking mode option = %v, want false", body.ChatTemplateKwargs["enable_thinking"])
+			}
+			io.WriteString(w, `{"prompt":"rendered prompt"}`)
+		case "/tokenize":
+			var body struct {
+				Content      string `json:"content"`
+				AddSpecial   bool   `json:"add_special"`
+				ParseSpecial bool   `json:"parse_special"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode tokenize request: %v", err)
+			}
+			if body.Content != "rendered prompt" || body.AddSpecial || !body.ParseSpecial {
+				t.Fatalf("unexpected tokenize request: %+v", body)
+			}
+			io.WriteString(w, `{"tokens":[1,2,3]}`)
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	})
+
+	size, err := c.ContextSize(context.Background())
+	if err != nil {
+		t.Fatalf("ContextSize: %v", err)
+	}
+	if size != 4096 {
+		t.Fatalf("context size = %d, want 4096", size)
+	}
+
+	count, err := c.CountChatTokens(context.Background(), ChatRequest{
+		Messages:           []Message{{Role: "user", Content: "hello"}},
+		Tools:              []Tool{{Type: "function", Function: FunctionDef{Name: "run_bash"}}},
+		ChatTemplateKwargs: map[string]any{"enable_thinking": false},
+	})
+	if err != nil {
+		t.Fatalf("CountChatTokens: %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("token count = %d, want 3", count)
+	}
+}
+
 func TestChatCompletionStream_ReasoningAndContent(t *testing.T) {
 	const sse = "" +
 		"data: {\"id\":\"ds-1\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"think \"}}]}\n\n" +
@@ -82,6 +143,13 @@ func TestChatCompletionStream_ReasoningAndContent(t *testing.T) {
 		"data: [DONE]\n\n"
 
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		var request ChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode stream request: %v", err)
+		}
+		if request.ChatTemplateKwargs["enable_thinking"] != false {
+			t.Errorf("thinking mode option = %v, want false", request.ChatTemplateKwargs["enable_thinking"])
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		io.WriteString(w, sse)
 	})
@@ -90,8 +158,9 @@ func TestChatCompletionStream_ReasoningAndContent(t *testing.T) {
 	defer cancel()
 
 	stream, err := c.ChatCompletionStream(ctx, ChatRequest{
-		Model:    "deepseek-reasoner-search",
-		Messages: []Message{{Role: "user", Content: "q"}},
+		Model:              "local-model",
+		Messages:           []Message{{Role: "user", Content: "q"}},
+		ChatTemplateKwargs: map[string]any{"enable_thinking": false},
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
