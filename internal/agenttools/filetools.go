@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -26,6 +27,10 @@ type readFileArgs struct {
 	MaxLines  int    `json:"max_lines"`
 }
 
+type listDirectoryArgs struct {
+	Path string `json:"path"`
+}
+
 type createFileArgs struct {
 	Path    string `json:"path"`
 	Content string `json:"content"`
@@ -33,6 +38,19 @@ type createFileArgs struct {
 
 func Definitions() []api.Tool {
 	return []api.Tool{
+		{
+			Type: "function",
+			Function: api.FunctionDef{
+				Name:        "list_directory",
+				Description: "Показать файлы и папки внутри каталога проекта Monya. Если path не указан, показать корневой каталог проекта. Используй для просмотра содержимого текущей папки; инструмент не требует подтверждения.",
+				Parameters: json.RawMessage(`{
+					"type": "object",
+					"properties": {
+						"path": {"type": "string", "description": "Путь каталога относительно корня проекта; по умолчанию корень проекта"}
+					}
+				}`),
+			},
+		},
 		{
 			Type: "function",
 			Function: api.FunctionDef{
@@ -68,7 +86,7 @@ func Definitions() []api.Tool {
 }
 
 func IsFileTool(name string) bool {
-	return name == "read_file" || name == "create_file"
+	return name == "list_directory" || name == "read_file" || name == "create_file"
 }
 
 func Execute(rootPath, name, arguments string) (string, error) {
@@ -86,6 +104,12 @@ func Execute(rootPath, name, arguments string) (string, error) {
 
 func execute(root *os.Root, name, arguments string) (string, error) {
 	switch name {
+	case "list_directory":
+		var args listDirectoryArgs
+		if err := json.Unmarshal([]byte(arguments), &args); err != nil {
+			return "", fmt.Errorf("invalid list_directory arguments: %w", err)
+		}
+		return listDirectory(root, args)
 	case "read_file":
 		var args readFileArgs
 		if err := json.Unmarshal([]byte(arguments), &args); err != nil {
@@ -101,6 +125,46 @@ func execute(root *os.Root, name, arguments string) (string, error) {
 	default:
 		return "", fmt.Errorf("unknown file tool %q", name)
 	}
+}
+
+func listDirectory(root *os.Root, args listDirectoryArgs) (string, error) {
+	path, err := cleanDirectoryPath(args.Path)
+	if err != nil {
+		return "", err
+	}
+	dir, err := root.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("open directory %q: %w", path, err)
+	}
+	entries, readErr := dir.ReadDir(-1)
+	closeErr := dir.Close()
+	if readErr != nil || closeErr != nil {
+		return "", errors.Join(
+			wrapIfError(readErr, fmt.Sprintf("read directory %q", path)),
+			wrapIfError(closeErr, fmt.Sprintf("close directory %q", path)),
+		)
+	}
+	if len(entries) == 0 {
+		return "Directory is empty.", nil
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Name() < entries[j].Name()
+	})
+
+	var output strings.Builder
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() {
+			name += "/"
+		}
+		if output.Len()+len(name)+1 > maxOutputBytes {
+			output.WriteString("[directory listing truncated]\n")
+			break
+		}
+		output.WriteString(name)
+		output.WriteByte('\n')
+	}
+	return output.String(), nil
 }
 
 func readFile(root *os.Root, args readFileArgs) (string, error) {
@@ -220,6 +284,16 @@ func cleanPath(name string) (string, error) {
 		return "", fmt.Errorf("path must name a file")
 	}
 	return path, nil
+}
+
+func cleanDirectoryPath(name string) (string, error) {
+	if name == "" || name == "." {
+		return ".", nil
+	}
+	if !filepath.IsLocal(name) {
+		return "", fmt.Errorf("path must be relative to the project root and must not escape it")
+	}
+	return filepath.Clean(name), nil
 }
 
 func wrapIfError(err error, message string) error {

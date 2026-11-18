@@ -120,6 +120,35 @@ func TestTrustedExecutionTogglePersistsForCurrentChat(t *testing.T) {
 	}
 }
 
+func TestToolsModeTogglePersistsForCurrentChat(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	m := New(api.NewClient("", ""), config.Default())
+	m.state = stateChat
+	m.workspace = store.Workspace{
+		Agents: []store.Agent{{ID: "agent-1", Name: "Helper"}},
+		Chats:  []store.Chat{{ID: "chat-1", Title: "Test", AgentID: "agent-1"}},
+	}
+	m.activeChat = m.workspace.Chats[0]
+	m.activeAgent = m.workspace.Agents[0]
+	_, _ = m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyF5})
+
+	if !m.activeChat.ToolsEnabled {
+		t.Fatal("tools mode should be enabled")
+	}
+	if !strings.Contains(m.chatStatusLine(), "TOOLS ON") {
+		t.Fatal("tools mode status is not visible")
+	}
+	workspace, err := store.LoadWorkspace()
+	if err != nil {
+		t.Fatalf("LoadWorkspace: %v", err)
+	}
+	if len(workspace.Chats) != 1 || !workspace.Chats[0].ToolsEnabled {
+		t.Fatalf("tools mode was not persisted: %+v", workspace.Chats)
+	}
+}
+
 func TestTrustedExecutionAutoRunsOnlySafeCommands(t *testing.T) {
 	for _, test := range []struct {
 		command string
@@ -159,6 +188,7 @@ func TestTrustedExecutionStartsSafeToolWithoutConfirmation(t *testing.T) {
 		Title:          "Test",
 		AgentID:        "agent-1",
 		TrustExecution: true,
+		ToolsEnabled:   true,
 	}
 	m := New(api.NewClient("", ""), config.Default())
 	m.state = stateChat
@@ -216,6 +246,7 @@ func TestTrustedExecutionRemembersExactApprovedCommand(t *testing.T) {
 		Title:          "Test",
 		AgentID:        "agent-1",
 		TrustExecution: true,
+		ToolsEnabled:   true,
 	}
 	m := New(api.NewClient("", ""), config.Default())
 	m.state = stateChat
@@ -269,9 +300,10 @@ func TestReadFileToolRunsWithoutCommandApproval(t *testing.T) {
 	}
 
 	chat := store.Chat{
-		ID:      strings.Repeat("c", 32),
-		Title:   "Test",
-		AgentID: "agent-1",
+		ID:           strings.Repeat("c", 32),
+		Title:        "Test",
+		AgentID:      "agent-1",
+		ToolsEnabled: true,
 	}
 	m := New(api.NewClient("", ""), config.Default())
 	m.state = stateChat
@@ -313,6 +345,48 @@ func TestReadFileToolRunsWithoutCommandApproval(t *testing.T) {
 	}
 }
 
+func TestListDirectoryToolRunsWithoutCommandApproval(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	project := t.TempDir()
+	if err := os.WriteFile(filepath.Join(project, "notes.txt"), []byte("hello"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	chat := store.Chat{
+		ID:           strings.Repeat("l", 32),
+		Title:        "Test",
+		AgentID:      "agent-1",
+		ToolsEnabled: true,
+	}
+	m := New(api.NewClient("", ""), config.Default())
+	m.state = stateChat
+	m.workspaceRoot = project
+	m.workspace = store.Workspace{
+		Agents: []store.Agent{{ID: "agent-1", Name: "Helper"}},
+		Chats:  []store.Chat{chat},
+	}
+	m.activeChat = chat
+	m.activeAgent = m.workspace.Agents[0]
+	m.currentToolCalls = []api.ToolCall{{
+		ID:       "list-call",
+		Type:     "function",
+		Function: api.FunctionArg{Name: "list_directory", Arguments: `{}`},
+	}}
+
+	_, cmd := m.Update(streamDoneMsg{})
+	if m.pendingToolCall != nil || m.commandRunning || cmd == nil {
+		t.Fatal("list_directory required command approval or did not start")
+	}
+	msg := cmd()
+	result, ok := msg.(fileToolDoneMsg)
+	if !ok {
+		t.Fatalf("directory tool returned %T, want fileToolDoneMsg", msg)
+	}
+	if result.err != nil || !strings.Contains(result.result, "notes.txt") {
+		t.Fatalf("directory listing result = %+v", result)
+	}
+}
+
 func TestFileToolsRunSequentiallyWithoutApproval(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	project := t.TempDir()
@@ -321,9 +395,10 @@ func TestFileToolsRunSequentiallyWithoutApproval(t *testing.T) {
 	}
 
 	chat := store.Chat{
-		ID:      strings.Repeat("d", 32),
-		Title:   "Test",
-		AgentID: "agent-1",
+		ID:           strings.Repeat("d", 32),
+		Title:        "Test",
+		AgentID:      "agent-1",
+		ToolsEnabled: true,
 	}
 	m := New(api.NewClient("", ""), config.Default())
 	m.state = stateChat
@@ -388,7 +463,8 @@ func TestFileToolsRunSequentiallyWithoutApproval(t *testing.T) {
 func TestChatRequestUsesAgentPromptAndSavedThinkingMode(t *testing.T) {
 	m := New(api.NewClient("", ""), config.Default())
 	m.cfg.SkillsPrompt = "You are Monya."
-	m.activeChat = store.Chat{ID: "chat-1", Thinking: false}
+	m.cfg.SkillsInstrumentsPrompt = "Use read_file for project files."
+	m.activeChat = store.Chat{ID: "chat-1", Thinking: false, ToolsEnabled: true}
 	m.activeAgent = store.Agent{Name: "Reviewer", SystemPrompt: "Review carefully."}
 	m.history = []api.Message{{Role: "user", Content: "Check this."}}
 
@@ -396,18 +472,23 @@ func TestChatRequestUsesAgentPromptAndSavedThinkingMode(t *testing.T) {
 	if len(req.Messages) != 2 || req.Messages[0].Role != "system" {
 		t.Fatalf("system prompt missing from request: %+v", req.Messages)
 	}
-	promptParts := strings.SplitN(req.Messages[0].Content, "\n\n", 2)
-	const dateTimePrefix = "Current local date and time (RFC3339): "
-	if !strings.HasPrefix(promptParts[0], dateTimePrefix) {
-		t.Fatalf("current date/time missing from system prompt: %q", promptParts[0])
+	const dateTimeMarker = "\n\nCurrent local date and time (RFC3339): "
+	dateTimeIndex := strings.LastIndex(req.Messages[0].Content, dateTimeMarker)
+	if dateTimeIndex < 0 {
+		t.Fatalf("current date/time missing from system prompt: %q", req.Messages[0].Content)
 	}
-	dateTime := strings.TrimSuffix(strings.TrimPrefix(promptParts[0], dateTimePrefix),
-		". Treat this as authoritative; do not assume a different date or year.")
+	staticPrompt := req.Messages[0].Content[:dateTimeIndex]
+	if want := "You are Monya.\n\nUse read_file for project files.\n\nReview carefully."; staticPrompt != want {
+		t.Fatalf("static prompt = %q, want %q", staticPrompt, want)
+	}
+	dateTime := strings.TrimPrefix(req.Messages[0].Content[dateTimeIndex:], dateTimeMarker)
 	if _, err := time.Parse(time.RFC3339, dateTime); err != nil {
 		t.Fatalf("date/time %q is not RFC3339: %v", dateTime, err)
 	}
-	if len(promptParts) != 2 || promptParts[1] != "You are Monya.\n\nReview carefully." {
-		t.Fatalf("skills and agent prompts missing from request: %q", req.Messages[0].Content)
+	nextRequest := m.chatRequest()
+	nextDateTimeIndex := strings.LastIndex(nextRequest.Messages[0].Content, dateTimeMarker)
+	if nextDateTimeIndex < 0 || nextRequest.Messages[0].Content[:nextDateTimeIndex] != staticPrompt {
+		t.Fatal("static prompt prefix changed between requests")
 	}
 	if req.ChatTemplateKwargs["enable_thinking"] != false {
 		t.Fatalf("thinking mode = %v, want false", req.ChatTemplateKwargs["enable_thinking"])
@@ -415,9 +496,186 @@ func TestChatRequestUsesAgentPromptAndSavedThinkingMode(t *testing.T) {
 	if req.MaxTokens != maxResponseTokens {
 		t.Fatalf("max_tokens = %d, want %d", req.MaxTokens, maxResponseTokens)
 	}
-	if len(req.Tools) != 3 || req.Tools[0].Function.Name != "run_bash" ||
-		req.Tools[1].Function.Name != "read_file" || req.Tools[2].Function.Name != "create_file" {
-		t.Fatalf("tools = %+v, want run_bash, read_file, create_file", req.Tools)
+	if len(req.Tools) != 4 || req.Tools[0].Function.Name != "run_bash" ||
+		req.Tools[1].Function.Name != "list_directory" || req.Tools[2].Function.Name != "read_file" ||
+		req.Tools[3].Function.Name != "create_file" {
+		t.Fatalf("tools = %+v, want run_bash, list_directory, read_file, create_file", req.Tools)
+	}
+}
+
+func TestResponseTokenBudgetScalesWithContext(t *testing.T) {
+	for _, test := range []struct {
+		contextSize int
+		want        int
+	}{
+		{contextSize: 4096, want: 1024},
+		{contextSize: 8192, want: 2048},
+		{contextSize: 16384, want: 4096},
+		{contextSize: 32768, want: 4096},
+	} {
+		if got := responseTokenBudget(test.contextSize); got != test.want {
+			t.Errorf("responseTokenBudget(%d) = %d, want %d", test.contextSize, got, test.want)
+		}
+	}
+}
+
+func TestChatRequestHidesToolsAndToolHistoryWhenDisabled(t *testing.T) {
+	m := New(api.NewClient("", ""), config.Default())
+	m.cfg.SkillsInstrumentsPrompt = "Secret tool instructions."
+	m.activeChat = store.Chat{ID: "chat-1"}
+	m.activeAgent = store.Agent{Name: "Helper"}
+	m.history = []api.Message{
+		{Role: "user", Content: "Read a file."},
+		{Role: "assistant", ToolCalls: []api.ToolCall{{
+			ID:       "tool-call-1",
+			Type:     "function",
+			Function: api.FunctionArg{Name: "read_file", Arguments: `{"path":"README.md"}`},
+		}}},
+		{Role: "tool", ToolCallID: "tool-call-1", Name: "read_file", Content: "file contents"},
+		{Role: "user", Content: "Thanks."},
+	}
+
+	req := m.chatRequest()
+	if len(req.Tools) != 0 {
+		t.Fatalf("tools = %+v, want none when tools mode is off", req.Tools)
+	}
+	if strings.Contains(req.Messages[0].Content, "Secret tool instructions.") {
+		t.Fatalf("instrument instructions leaked while tools are disabled: %q", req.Messages[0].Content)
+	}
+	if len(req.Messages) != 3 || req.Messages[1].Role != "user" || req.Messages[2].Role != "user" {
+		t.Fatalf("tool history was not stripped from request: %+v", req.Messages)
+	}
+	for _, message := range req.Messages {
+		if message.Role == "tool" || len(message.ToolCalls) > 0 {
+			t.Fatalf("tool history leaked while tools are disabled: %+v", req.Messages)
+		}
+	}
+}
+
+func TestDisabledToolsModeRejectsUnexpectedToolCalls(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	project := t.TempDir()
+	chat := store.Chat{ID: strings.Repeat("e", 32), Title: "Test", AgentID: "agent-1"}
+	agent := store.Agent{ID: "agent-1", Name: "Helper"}
+	m := New(api.NewClient("", ""), config.Default())
+	m.state = stateChat
+	m.workspaceRoot = project
+	m.workspace = store.Workspace{Agents: []store.Agent{agent}, Chats: []store.Chat{chat}}
+	m.activeChat = chat
+	m.activeAgent = agent
+	m.currentToolCalls = []api.ToolCall{{
+		ID:       "create-call",
+		Type:     "function",
+		Function: api.FunctionArg{Name: "create_file", Arguments: `{"path":"must-not-exist.txt","content":"no"}`},
+	}}
+
+	_, cmd := m.Update(streamDoneMsg{})
+	if cmd != nil {
+		t.Fatal("disabled tool call unexpectedly started a command")
+	}
+	if _, err := os.Stat(filepath.Join(project, "must-not-exist.txt")); !os.IsNotExist(err) {
+		t.Fatalf("disabled tool call created a file, stat err=%v", err)
+	}
+	if len(m.history) != 1 || m.history[0].Role != "assistant" ||
+		!strings.Contains(m.history[0].Content, "Tools are disabled") ||
+		len(m.history[0].ToolCalls) != 0 {
+		t.Fatalf("unexpected response to disabled tool call: %+v", m.history)
+	}
+}
+
+func TestReasoningOnlyStreamRetriesWithThinkingPreserved(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	chat := store.Chat{ID: strings.Repeat("f", 32), Title: "Test", AgentID: "agent-1", Thinking: true}
+	agent := store.Agent{ID: "agent-1", Name: "Helper"}
+	m := New(api.NewClient("", ""), config.Default())
+	m.state = stateChat
+	m.workspace = store.Workspace{Agents: []store.Agent{agent}, Chats: []store.Chat{chat}}
+	m.activeChat = chat
+	m.activeAgent = agent
+	m.history = []api.Message{{Role: "user", Content: "Привет"}}
+	m.viewport.Width = 80
+	m.currentMaxTokens = responseTokenBudget(16384)
+	m.isStreaming = true
+	finishReason := "stop"
+
+	_, _ = m.Update(chunkMsg(api.StreamChunk{Choices: []api.StreamDelta{{
+		Delta:        api.Delta{ReasoningContent: "Reasoning without an answer."},
+		FinishReason: &finishReason,
+	}}}))
+	_, retryCmd := m.Update(streamDoneMsg{})
+	if retryCmd == nil || !m.finalAnswerRetry || !m.isStreaming {
+		t.Fatal("reasoning-only response did not trigger a final-answer retry")
+	}
+	retryRequest := m.chatRequest()
+	if retryRequest.ChatTemplateKwargs["enable_thinking"] != true {
+		t.Fatal("final-answer retry should preserve the saved thinking preference")
+	}
+	if retryRequest.MaxTokens != responseTokenBudget(16384) {
+		t.Fatalf("retry max_tokens = %d, want %d", retryRequest.MaxTokens, responseTokenBudget(16384))
+	}
+	if strings.Contains(retryRequest.Messages[0].Content, "previous attempt ended") ||
+		strings.Contains(retryRequest.Messages[0].Content, "alternative phrasings") {
+		t.Fatal("application-added coaching prompt leaked into the retry")
+	}
+	if !strings.Contains(m.chatStatusLine(), "THINKING ON (RETRY)") {
+		t.Fatal("retry thinking status is not visible")
+	}
+	if !m.activeChat.Thinking {
+		t.Fatal("retry changed the saved thinking preference")
+	}
+
+	_, _ = m.Update(chunkMsg(api.StreamChunk{Choices: []api.StreamDelta{{
+		Delta: api.Delta{Content: "Привет!"},
+	}}}))
+	_, _ = m.Update(streamDoneMsg{})
+	if m.finalAnswerRetry || m.isStreaming {
+		t.Fatal("successful retry did not finish")
+	}
+	if len(m.history) != 2 || m.history[1].Role != "assistant" || m.history[1].Content != "Привет!" {
+		t.Fatalf("visible answer was not saved: %+v", m.history)
+	}
+}
+
+func TestRepeatedEmptyStreamShowsVisibleError(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	chat := store.Chat{ID: strings.Repeat("g", 32), Title: "Test", AgentID: "agent-1"}
+	agent := store.Agent{ID: "agent-1", Name: "Helper"}
+	m := New(api.NewClient("", ""), config.Default())
+	m.state = stateChat
+	m.workspace = store.Workspace{Agents: []store.Agent{agent}, Chats: []store.Chat{chat}}
+	m.activeChat = chat
+	m.activeAgent = agent
+	m.finalAnswerRetry = true
+	m.currentFinishReason = "length"
+	m.isStreaming = true
+
+	_, cmd := m.Update(streamDoneMsg{})
+	if cmd != nil || m.finalAnswerRetry || m.isStreaming {
+		t.Fatal("empty retry unexpectedly continued")
+	}
+	if !strings.Contains(m.chatError, "response token limit") {
+		t.Fatalf("missing explicit no-answer error: %q", m.chatError)
+	}
+}
+
+func TestLengthCutoffDoesNotRepeatReasoning(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	chat := store.Chat{ID: strings.Repeat("h", 32), Title: "Test", AgentID: "agent-1"}
+	agent := store.Agent{ID: "agent-1", Name: "Helper"}
+	m := New(api.NewClient("", ""), config.Default())
+	m.state = stateChat
+	m.workspace = store.Workspace{Agents: []store.Agent{agent}, Chats: []store.Chat{chat}}
+	m.activeChat = chat
+	m.activeAgent = agent
+	m.currentFinishReason = "length"
+	m.isStreaming = true
+
+	_, cmd := m.Update(streamDoneMsg{})
+	if cmd != nil || m.finalAnswerRetry || m.isStreaming {
+		t.Fatal("token-limit cutoff started another generation")
+	}
+	if !strings.Contains(m.chatError, "No repeat request was sent") {
+		t.Fatalf("missing token-limit notice: %q", m.chatError)
 	}
 }
 
@@ -435,14 +693,14 @@ func TestChatViewShowsThinkingAndSelectedTerminal(t *testing.T) {
 	_, _ = m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 
 	view := m.viewChat()
-	for _, status := range []string{"THINKING ON", "TRUST EXEC OFF", "TERMINAL: Terminal 1"} {
+	for _, status := range []string{"THINKING ON", "TRUST EXEC OFF", "TOOLS OFF", "TERMINAL: Terminal 1"} {
 		if !strings.Contains(view, status) {
 			t.Fatalf("chat view does not show %q: %s", status, view)
 		}
 	}
 	m.isStreaming = true
 	view = m.viewChat()
-	for _, status := range []string{"THINKING ON", "TRUST EXEC OFF", "TERMINAL: Terminal 1"} {
+	for _, status := range []string{"THINKING ON", "TRUST EXEC OFF", "TOOLS OFF", "TERMINAL: Terminal 1"} {
 		if !strings.Contains(view, status) {
 			t.Fatalf("streaming chat view does not show %q: %s", status, view)
 		}
@@ -450,9 +708,13 @@ func TestChatViewShowsThinkingAndSelectedTerminal(t *testing.T) {
 
 	m.isStreaming = false
 	m.activeChat.Thinking = false
+	m.activeChat.ToolsEnabled = true
 	view = m.viewChat()
 	if !strings.Contains(view, "THINKING OFF") {
 		t.Fatalf("chat view does not show thinking off: %s", view)
+	}
+	if !strings.Contains(view, "TOOLS ON") {
+		t.Fatalf("chat view does not show tools on: %s", view)
 	}
 }
 

@@ -58,7 +58,11 @@ func TestLoadFromReadsSkillsPromptNextToConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	const skills = "# Monya\nAnswer clearly and concisely.\n"
+	const instrumentSkills = "Prefer read_file over shell commands."
 	if err := os.WriteFile(filepath.Join(dir, "skills.md"), []byte(skills), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "skills-instruments.md"), []byte(instrumentSkills), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -68,6 +72,9 @@ func TestLoadFromReadsSkillsPromptNextToConfig(t *testing.T) {
 	}
 	if cfg.SkillsPrompt != skills {
 		t.Fatalf("SkillsPrompt = %q, want %q", cfg.SkillsPrompt, skills)
+	}
+	if cfg.SkillsInstrumentsPrompt != instrumentSkills {
+		t.Fatalf("SkillsInstrumentsPrompt = %q, want %q", cfg.SkillsInstrumentsPrompt, instrumentSkills)
 	}
 }
 

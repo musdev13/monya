@@ -17,11 +17,12 @@ type RateLimit struct {
 
 // Config holds all tunable parameters of monya.
 type Config struct {
-	APIURL       string    `toml:"api_url"`
-	DefaultModel string    `toml:"default_model"`
-	DefaultAgent string    `toml:"default_agent"`
-	SkillsPrompt string    `toml:"-"`
-	RateLimit    RateLimit `toml:"rate_limit"`
+	APIURL                  string    `toml:"api_url"`
+	DefaultModel            string    `toml:"default_model"`
+	DefaultAgent            string    `toml:"default_agent"`
+	SkillsPrompt            string    `toml:"-"`
+	SkillsInstrumentsPrompt string    `toml:"-"`
+	RateLimit               RateLimit `toml:"rate_limit"`
 }
 
 // Default returns the built-in configuration.
@@ -64,13 +65,21 @@ func LoadFrom(path string) (*Config, error) {
 		}
 	}
 
-	skillsPath := filepath.Join(filepath.Dir(path), "skills.md")
-	skillsPrompt, err := os.ReadFile(skillsPath)
-	if err != nil && !os.IsNotExist(err) {
-		return nil, fmt.Errorf("read skills file %q: %w", skillsPath, err)
-	}
-	if err == nil {
-		cfg.SkillsPrompt = string(skillsPrompt)
+	for _, file := range []struct {
+		name   string
+		prompt *string
+	}{
+		{name: "skills.md", prompt: &cfg.SkillsPrompt},
+		{name: "skills-instruments.md", prompt: &cfg.SkillsInstrumentsPrompt},
+	} {
+		filePath := filepath.Join(filepath.Dir(path), file.name)
+		content, err := os.ReadFile(filePath)
+		if err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("read skills file %q: %w", filePath, err)
+		}
+		if err == nil {
+			*file.prompt = string(content)
+		}
 	}
 
 	// Sanity fallbacks

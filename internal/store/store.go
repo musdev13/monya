@@ -25,6 +25,7 @@ type Chat struct {
 	AgentID        string    `json:"agent_id"`
 	Thinking       bool      `json:"thinking"`
 	TrustExecution bool      `json:"trust_execution"`
+	ToolsEnabled   bool      `json:"tools_enabled"`
 	UpdatedAt      time.Time `json:"updated_at"`
 	LegacyName     string    `json:"legacy_name,omitempty"`
 }

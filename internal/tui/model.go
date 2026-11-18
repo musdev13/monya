@@ -50,6 +50,7 @@ const (
 
 const (
 	maxResponseTokens   = 1024
+	maxResponseTokenCap = 4096
 	contextSafetyTokens = 64
 )
 
@@ -65,6 +66,7 @@ type (
 	streamStartedMsg struct {
 		stream         *api.Stream
 		contextTrimmed int
+		maxTokens      int
 	}
 	chunkMsg      api.StreamChunk
 	streamDoneMsg struct{}
@@ -105,7 +107,11 @@ type chatItem struct {
 
 func (i chatItem) Title() string { return i.chat.Title }
 func (i chatItem) Description() string {
-	return fmt.Sprintf("%s · thinking %s", i.agentName, thinkingLabel(i.chat.Thinking))
+	toolsLabel := "off"
+	if i.chat.ToolsEnabled {
+		toolsLabel = "on"
+	}
+	return fmt.Sprintf("%s · thinking %s · tools %s", i.agentName, thinkingLabel(i.chat.Thinking), toolsLabel)
 }
 func (i chatItem) FilterValue() string { return i.chat.Title + " " + i.agentName }
 
@@ -197,14 +203,19 @@ type Model struct {
 	history     []api.Message
 
 	// Streaming state
-	spinner          spinner.Model
-	isStreaming      bool
-	stream           *api.Stream
-	cancelStream     context.CancelFunc
-	currentReasoning string
-	currentResponse  string
-	currentToolCalls []api.ToolCall
-	toolCallQueue    []api.ToolCall
+	spinner             spinner.Model
+	isStreaming         bool
+	stream              *api.Stream
+	cancelStream        context.CancelFunc
+	currentReasoning    string
+	currentResponse     string
+	currentToolCalls    []api.ToolCall
+	toolCallQueue       []api.ToolCall
+	currentFinishReason string
+	finalAnswerRetry    bool
+	finalAnswerTokens   int
+	currentMaxTokens    int
+	fileToolRunning     bool
 
 	// Command execution state
 	pendingToolCall  *api.ToolCall
@@ -571,35 +582,56 @@ func (m *Model) chatRequest() api.ChatRequest {
 		reqHistory[i].ReasoningContent = "" // API не ожидает это поле в запросе
 	}
 	normalizeToolCallHistory(reqHistory)
-	systemPrompt := "Current local date and time (RFC3339): " +
-		time.Now().Format(time.RFC3339) +
-		". Treat this as authoritative; do not assume a different date or year."
-	for _, prompt := range []string{m.cfg.SkillsPrompt, m.activeAgent.SystemPrompt} {
+	if !m.activeChat.ToolsEnabled {
+		reqHistory = stripToolHistory(reqHistory)
+	}
+	prompts := []string{m.cfg.SkillsPrompt}
+	if m.activeChat.ToolsEnabled {
+		prompts = append(prompts, m.cfg.SkillsInstrumentsPrompt)
+	}
+	prompts = append(prompts, m.activeAgent.SystemPrompt)
+	var systemPrompt strings.Builder
+	for _, prompt := range prompts {
 		if prompt = strings.TrimSpace(prompt); prompt != "" {
-			systemPrompt += "\n\n" + prompt
+			if systemPrompt.Len() > 0 {
+				systemPrompt.WriteString("\n\n")
+			}
+			systemPrompt.WriteString(prompt)
 		}
 	}
-	reqHistory = append([]api.Message{{Role: "system", Content: systemPrompt}}, reqHistory...)
+	if systemPrompt.Len() > 0 {
+		systemPrompt.WriteString("\n\n")
+	}
+	systemPrompt.WriteString("Current local date and time (RFC3339): ")
+	systemPrompt.WriteString(time.Now().Format(time.RFC3339))
+	reqHistory = append([]api.Message{{Role: "system", Content: systemPrompt.String()}}, reqHistory...)
 
-	tools := []api.Tool{{
-		Type: "function",
-		Function: api.FunctionDef{
-			Name:        "run_bash",
-			Description: "Выполнить bash-команду в выбранном пользователем терминале Monya и вернуть stdout+stderr. Состояние shell, включая cwd и переменные, сохраняется между вызовами.",
-			Parameters: json.RawMessage(`{
-				"type": "object",
-				"properties": {
-					"command": {"type": "string", "description": "Bash-команда для выполнения"}
-				},
-				"required": ["command"]
-			}`),
-		},
-	}}
-	tools = append(tools, agenttools.Definitions()...)
+	var tools []api.Tool
+	if m.activeChat.ToolsEnabled {
+		tools = append(tools, api.Tool{
+			Type: "function",
+			Function: api.FunctionDef{
+				Name:        "run_bash",
+				Description: "Выполнить bash-команду в выбранном пользователем терминале Monya и вернуть stdout+stderr. Состояние shell, включая cwd и переменные, сохраняется между вызовами.",
+				Parameters: json.RawMessage(`{
+					"type": "object",
+					"properties": {
+						"command": {"type": "string", "description": "Bash-команда для выполнения"}
+					},
+					"required": ["command"]
+				}`),
+			},
+		})
+		tools = append(tools, agenttools.Definitions()...)
+	}
 
+	maxTokens := maxResponseTokens
+	if m.finalAnswerRetry && m.finalAnswerTokens > maxTokens {
+		maxTokens = m.finalAnswerTokens
+	}
 	return api.ChatRequest{
 		Model:     m.cfg.DefaultModel,
-		MaxTokens: maxResponseTokens,
+		MaxTokens: maxTokens,
 		User:      m.activeChat.ID,
 		Messages:  reqHistory,
 		ChatTemplateKwargs: map[string]any{
@@ -614,6 +646,7 @@ func (m *Model) startStream() tea.Cmd {
 	m.currentReasoning = ""
 	m.currentResponse = ""
 	m.currentToolCalls = nil
+	m.currentFinishReason = ""
 	m.chatError = ""
 	m.contextNotice = ""
 	m.updateViewport()
@@ -621,6 +654,8 @@ func (m *Model) startStream() tea.Cmd {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancelStream = cancel
 	req := m.chatRequest()
+	finalAnswerRetry := m.finalAnswerRetry
+	finalAnswerTokens := m.finalAnswerTokens
 
 	return func() tea.Msg {
 		prepCtx, prepCancel := context.WithTimeout(ctx, 30*time.Second)
@@ -630,6 +665,10 @@ func (m *Model) startStream() tea.Cmd {
 		if err != nil {
 			cancel()
 			return streamErrMsg{err: fmt.Errorf("read model context size: %w", err)}
+		}
+		req.MaxTokens = responseTokenBudget(contextSize)
+		if finalAnswerRetry && finalAnswerTokens > req.MaxTokens {
+			req.MaxTokens = min(finalAnswerTokens, contextSize/2)
 		}
 		promptBudget := contextSize - req.MaxTokens - contextSafetyTokens
 		fittedReq, trimmed, err := fitChatRequest(prepCtx, m.client, req, promptBudget)
@@ -643,8 +682,21 @@ func (m *Model) startStream() tea.Cmd {
 			cancel()
 			return streamErrMsg{err: err}
 		}
-		return streamStartedMsg{stream: stream, contextTrimmed: trimmed}
+		return streamStartedMsg{
+			stream:         stream,
+			contextTrimmed: trimmed,
+			maxTokens:      req.MaxTokens,
+		}
 	}
+}
+
+func responseTokenBudget(contextSize int) int {
+	// Reserve a quarter of the context for generation, with bounded minimum and maximum budgets.
+	tokens := contextSize / 4
+	if tokens < maxResponseTokens {
+		return maxResponseTokens
+	}
+	return min(tokens, maxResponseTokenCap)
 }
 
 func fitChatRequest(ctx context.Context, client *api.Client, req api.ChatRequest, promptBudget int) (api.ChatRequest, int, error) {
@@ -745,6 +797,23 @@ func normalizeToolCallHistory(messages []api.Message) {
 			}
 		}
 	}
+}
+
+func stripToolHistory(messages []api.Message) []api.Message {
+	filtered := make([]api.Message, 0, len(messages))
+	for _, message := range messages {
+		if message.Role == "tool" || message.ToolCallID != "" {
+			continue
+		}
+		if len(message.ToolCalls) > 0 {
+			message.ToolCalls = nil
+			if strings.TrimSpace(message.Content) == "" && message.ReasoningContent == "" {
+				continue
+			}
+		}
+		filtered = append(filtered, message)
+	}
+	return filtered
 }
 
 func parseRunBashCommand(arguments string) (string, error) {
@@ -1203,6 +1272,29 @@ func (m *Model) toggleTrustExecution() {
 			}
 		}
 		m.chatError = fmt.Sprintf("Save trusted execution setting: %v", err)
+		return
+	}
+	m.chatError = ""
+}
+
+func (m *Model) toggleToolsMode() {
+	oldValue := m.activeChat.ToolsEnabled
+	m.activeChat.ToolsEnabled = !oldValue
+	for i := range m.workspace.Chats {
+		if m.workspace.Chats[i].ID == m.activeChat.ID {
+			m.workspace.Chats[i] = m.activeChat
+			break
+		}
+	}
+	if err := store.SaveWorkspace(m.workspace); err != nil {
+		m.activeChat.ToolsEnabled = oldValue
+		for i := range m.workspace.Chats {
+			if m.workspace.Chats[i].ID == m.activeChat.ID {
+				m.workspace.Chats[i].ToolsEnabled = oldValue
+				break
+			}
+		}
+		m.chatError = fmt.Sprintf("Save tools mode setting: %v", err)
 		return
 	}
 	m.chatError = ""
@@ -1920,6 +2012,7 @@ func (m *Model) processNextToolCall() tea.Cmd {
 		}
 
 		if agenttools.IsFileTool(call.Function.Name) {
+			m.fileToolRunning = true
 			m.history = append(m.history, api.Message{
 				Role:       "tool",
 				ToolCallID: call.ID,
@@ -2086,6 +2179,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case streamStartedMsg:
 		m.stream = msg.stream
+		m.currentMaxTokens = msg.maxTokens
 		if msg.contextTrimmed > 0 {
 			m.contextNotice = fmt.Sprintf("Context compacted: omitted %d older messages from this request", msg.contextTrimmed)
 		} else {
@@ -2106,6 +2200,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.chatError = fmt.Sprintf("Unexpected result from file tool %q", msg.name)
 			return m, nil
 		}
+		m.fileToolRunning = false
 		content := msg.result
 		if msg.err != nil {
 			content = "File tool failed: " + msg.err.Error()
@@ -2187,6 +2282,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyMsg:
 			if m.commandTimedOut {
 				m.handleCommandTimeoutKey(msg)
+				return m, nil
+			}
+			if m.fileToolRunning {
+				if msg.String() == "pgup" || msg.String() == "pgdown" {
+					var cmd tea.Cmd
+					m.viewport, cmd = m.viewport.Update(msg)
+					return m, cmd
+				}
 				return m, nil
 			}
 
@@ -2290,6 +2393,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.toggleTrustExecution()
 				return m, nil
 			}
+			if msg.String() == "f5" && !m.isStreaming && !m.commandRunning &&
+				!m.fileToolRunning && m.pendingToolCall == nil {
+				m.toggleToolsMode()
+				return m, nil
+			}
 			if msg.String() == "ctrl+t" && !m.isStreaming {
 				m.terminalReturnState = stateChat
 				m.state = stateTerminals
@@ -2307,6 +2415,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.cancelStream()
 					}
 					m.isStreaming = false
+					m.finalAnswerRetry = false
+					m.finalAnswerTokens = 0
 					m.updateViewport()
 					return m, nil
 				}
@@ -2318,6 +2428,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "enter":
 				text := strings.TrimSpace(m.textarea.Value())
 				if text != "" && !m.isStreaming {
+					m.finalAnswerRetry = false
+					m.finalAnswerTokens = 0
 					m.history = append(m.history, api.Message{Role: "user", Content: text})
 					m.persistActiveChat()
 					m.textarea.Reset()
@@ -2339,6 +2451,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case chunkMsg:
 			if len(msg.Choices) > 0 {
 				d := msg.Choices[0].Delta
+				if finishReason := msg.Choices[0].FinishReason; finishReason != nil {
+					m.currentFinishReason = *finishReason
+				}
 				if d.ReasoningContent != "" {
 					m.currentReasoning += d.ReasoningContent
 				}
@@ -2363,7 +2478,31 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cancelStream = nil
 			}
 
+			if len(m.currentToolCalls) > 0 && !m.activeChat.ToolsEnabled {
+				content := strings.TrimSpace(m.currentResponse)
+				if content != "" {
+					content += "\n\n"
+				}
+				content += "Tools are disabled for this chat. Press F5 to enable them, then ask again."
+				m.history = append(m.history, api.Message{
+					Role:             "assistant",
+					Content:          content,
+					ReasoningContent: m.currentReasoning,
+				})
+				m.persistActiveChat()
+				m.currentReasoning = ""
+				m.currentResponse = ""
+				m.currentFinishReason = ""
+				m.currentToolCalls = nil
+				m.finalAnswerRetry = false
+				m.finalAnswerTokens = 0
+				m.updateViewport()
+				return m, nil
+			}
+
 			if len(m.currentToolCalls) > 0 {
+				m.finalAnswerRetry = false
+				m.finalAnswerTokens = 0
 				for i := range m.currentToolCalls {
 					if m.currentToolCalls[i].Type == "" {
 						m.currentToolCalls[i].Type = "function"
@@ -2379,26 +2518,53 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.toolCallQueue = append(m.toolCallQueue[:0], m.currentToolCalls...)
 				m.currentReasoning = ""
 				m.currentResponse = ""
+				m.currentFinishReason = ""
 				m.currentToolCalls = nil
 				return m, m.processNextToolCall()
-			} else {
-				if m.currentResponse != "" || m.currentReasoning != "" {
-					m.history = append(m.history, api.Message{
-						Role:             "assistant",
-						Content:          m.currentResponse,
-						ReasoningContent: m.currentReasoning,
-					})
+			}
+			if strings.TrimSpace(m.currentResponse) == "" {
+				if !m.finalAnswerRetry && m.currentFinishReason != "length" {
+					m.finalAnswerRetry = true
+					m.finalAnswerTokens = maxResponseTokens
+					if m.currentMaxTokens > m.finalAnswerTokens {
+						m.finalAnswerTokens = m.currentMaxTokens
+					}
+					m.currentReasoning = ""
+					m.currentFinishReason = ""
+					m.updateViewport()
+					return m, m.startStream()
+				}
+				m.finalAnswerRetry = false
+				m.finalAnswerTokens = 0
+				m.currentReasoning = ""
+				if m.currentFinishReason == "length" {
+					m.chatError = "Model reached the response token limit without producing an answer. No repeat request was sent."
+				} else {
+					m.chatError = "Model finished without producing an answer after retry. Try sending the request again."
 				}
 				m.persistActiveChat()
-				m.currentReasoning = ""
-				m.currentResponse = ""
 				m.updateViewport()
+				return m, nil
 			}
+			m.history = append(m.history, api.Message{
+				Role:             "assistant",
+				Content:          m.currentResponse,
+				ReasoningContent: m.currentReasoning,
+			})
+			m.persistActiveChat()
+			m.currentReasoning = ""
+			m.currentResponse = ""
+			m.currentFinishReason = ""
+			m.finalAnswerRetry = false
+			m.finalAnswerTokens = 0
+			m.updateViewport()
 			return m, nil
 
 		case streamErrMsg:
 			m.isStreaming = false
 			m.chatError = fmt.Sprintf("Error: %v", msg.err)
+			m.finalAnswerRetry = false
+			m.finalAnswerTokens = 0
 			if m.stream != nil {
 				m.stream.Close()
 				m.stream = nil
@@ -2589,15 +2755,28 @@ func (m *Model) viewChat() string {
 		} else {
 			b.WriteString(helpStyle.Render("[enter/y] run once  [n]o"))
 		}
+	} else if m.fileToolRunning {
+		b.WriteString(fmt.Sprintf("%s Working with file...", m.spinner.View()))
 	} else if m.isStreaming {
-		b.WriteString(fmt.Sprintf("%s Streaming... [esc] to cancel", m.spinner.View()))
+		if m.finalAnswerRetry {
+			thinkingLabel := "on"
+			if !m.activeChat.Thinking {
+				thinkingLabel = "off"
+			}
+			b.WriteString(fmt.Sprintf("%s Retrying with thinking %s...", m.spinner.View(), thinkingLabel))
+			if m.finalAnswerTokens > maxResponseTokens {
+				b.WriteString(" (same token budget)")
+			}
+		} else {
+			b.WriteString(fmt.Sprintf("%s Streaming... [esc] to cancel", m.spinner.View()))
+		}
 	} else {
 		b.WriteString(lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("238")).Width(m.viewport.Width).Render(m.textarea.View()))
 		mouseState := "off"
 		if m.mouseOn {
 			mouseState = "on"
 		}
-		b.WriteString("\n" + helpStyle.Render("[enter] send  [ctrl+j] newline  [ctrl+y] copy answer  [ctrl+b] copy code  [click block] copy  [pgup/pgdown] scroll  [f2] mouse:"+mouseState+"  [f3] thinking  [f4] trusted execution  [ctrl+t] terminals  [esc] back"))
+		b.WriteString("\n" + helpStyle.Render("[enter] send  [ctrl+j] newline  [ctrl+y] copy answer  [ctrl+b] copy code  [click block] copy  [pgup/pgdown] scroll  [f2] mouse:"+mouseState+"  [f3] thinking  [f4] trusted execution  [f5] tools  [ctrl+t] terminals  [esc] back"))
 	}
 	if m.copyStatus != "" {
 		b.WriteString("\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Render("✓ "+m.copyStatus))
@@ -2633,16 +2812,23 @@ func (m *Model) activeTerminalName() string {
 
 func (m *Model) chatStatusLine() string {
 	width := max(1, m.viewport.Width)
+	thinkingEnabled := m.activeChat.Thinking
 	thinkingBadge := lipgloss.NewStyle().Bold(true).Padding(0, 1)
-	if m.activeChat.Thinking {
+	if thinkingEnabled {
 		thinkingBadge = thinkingBadge.Foreground(lipgloss.Color("0")).Background(lipgloss.Color("42"))
 	} else {
 		thinkingBadge = thinkingBadge.Foreground(lipgloss.Color("15")).Background(lipgloss.Color("160"))
 	}
-	thinking := ansi.Wrap(thinkingBadge.Render("THINKING ON"), width, "")
-	if !m.activeChat.Thinking {
-		thinking = ansi.Wrap(thinkingBadge.Render("THINKING OFF"), width, "")
+	thinkingLabel := "THINKING OFF"
+	if thinkingEnabled {
+		thinkingLabel = "THINKING ON"
+	} else if m.finalAnswerRetry {
+		thinkingLabel = "THINKING OFF (RETRY)"
 	}
+	if m.finalAnswerRetry && m.activeChat.Thinking {
+		thinkingLabel = "THINKING ON (RETRY)"
+	}
+	thinking := ansi.Wrap(thinkingBadge.Render(thinkingLabel), width, "")
 	executionBadge := lipgloss.NewStyle().Bold(true).Padding(0, 1)
 	executionLabel := "TRUST EXEC OFF"
 	if m.activeChat.TrustExecution {
@@ -2652,9 +2838,18 @@ func (m *Model) chatStatusLine() string {
 		executionBadge = executionBadge.Foreground(lipgloss.Color("15")).Background(lipgloss.Color("238"))
 	}
 	execution := ansi.Wrap(executionBadge.Render(executionLabel), width, "")
+	toolsBadge := lipgloss.NewStyle().Bold(true).Padding(0, 1)
+	toolsLabel := "TOOLS OFF"
+	if m.activeChat.ToolsEnabled {
+		toolsBadge = toolsBadge.Foreground(lipgloss.Color("0")).Background(lipgloss.Color("42"))
+		toolsLabel = "TOOLS ON"
+	} else {
+		toolsBadge = toolsBadge.Foreground(lipgloss.Color("15")).Background(lipgloss.Color("238"))
+	}
+	tools := ansi.Wrap(toolsBadge.Render(toolsLabel), width, "")
 	terminalBadge := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Background(lipgloss.Color("24"))
 	activeTerminal := ansi.Wrap(terminalBadge.Render("TERMINAL: "+m.activeTerminalName()), width, "")
-	badges := []string{thinking, execution, activeTerminal}
+	badges := []string{thinking, execution, tools, activeTerminal}
 	totalWidth := 0
 	for _, badge := range badges {
 		totalWidth += lipgloss.Width(badge)

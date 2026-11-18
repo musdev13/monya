@@ -27,6 +27,24 @@ func TestReadFileReturnsRequestedLineRange(t *testing.T) {
 	}
 }
 
+func TestListDirectoryDefaultsToProjectRoot(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("hello"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := Execute(root, "list_directory", `{}`)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if want := "README.md\nsrc/\n"; got != want {
+		t.Fatalf("list_directory output = %q, want %q", got, want)
+	}
+}
+
 func TestFileToolsRejectPathsOutsideProjectRoot(t *testing.T) {
 	root := t.TempDir()
 	outside := filepath.Join(t.TempDir(), "secret.txt")
@@ -40,6 +58,9 @@ func TestFileToolsRejectPathsOutsideProjectRoot(t *testing.T) {
 		}
 		if _, err := Execute(root, "create_file", `{"path":`+quoteJSON(path)+`,"content":"bad"}`); err == nil {
 			t.Errorf("create_file accepted outside path %q", path)
+		}
+		if _, err := Execute(root, "list_directory", `{"path":`+quoteJSON(path)+`}`); err == nil {
+			t.Errorf("list_directory accepted outside path %q", path)
 		}
 	}
 }
@@ -86,6 +107,9 @@ func TestFileToolsCannotFollowSymlinkOutsideProjectRoot(t *testing.T) {
 	}
 	if _, err := Execute(root, "create_file", `{"path":"external/new.txt","content":"bad"}`); err == nil {
 		t.Fatal("create_file followed a symlink outside the project root")
+	}
+	if _, err := Execute(root, "list_directory", `{"path":"external"}`); err == nil {
+		t.Fatal("list_directory followed a symlink outside the project root")
 	}
 	if _, err := os.Stat(filepath.Join(outside, "new.txt")); !os.IsNotExist(err) {
 		t.Fatalf("outside file was created: stat error = %v", err)
