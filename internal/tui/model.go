@@ -571,9 +571,15 @@ func (m *Model) chatRequest() api.ChatRequest {
 		reqHistory[i].ReasoningContent = "" // API не ожидает это поле в запросе
 	}
 	normalizeToolCallHistory(reqHistory)
-	if m.activeAgent.SystemPrompt != "" {
-		reqHistory = append([]api.Message{{Role: "system", Content: m.activeAgent.SystemPrompt}}, reqHistory...)
+	systemPrompt := "Current local date and time (RFC3339): " +
+		time.Now().Format(time.RFC3339) +
+		". Treat this as authoritative; do not assume a different date or year."
+	for _, prompt := range []string{m.cfg.SkillsPrompt, m.activeAgent.SystemPrompt} {
+		if prompt = strings.TrimSpace(prompt); prompt != "" {
+			systemPrompt += "\n\n" + prompt
+		}
 	}
+	reqHistory = append([]api.Message{{Role: "system", Content: systemPrompt}}, reqHistory...)
 
 	tools := []api.Tool{{
 		Type: "function",

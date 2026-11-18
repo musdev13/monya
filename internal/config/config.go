@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -19,6 +20,7 @@ type Config struct {
 	APIURL       string    `toml:"api_url"`
 	DefaultModel string    `toml:"default_model"`
 	DefaultAgent string    `toml:"default_agent"`
+	SkillsPrompt string    `toml:"-"`
 	RateLimit    RateLimit `toml:"rate_limit"`
 }
 
@@ -53,15 +55,22 @@ func LoadFrom(path string) (*Config, error) {
 	cfg := Default()
 
 	b, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return cfg, nil
-		}
+	if err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
+	if err == nil {
+		if err := toml.Unmarshal(b, cfg); err != nil {
+			return nil, err
+		}
+	}
 
-	if err := toml.Unmarshal(b, cfg); err != nil {
-		return nil, err
+	skillsPath := filepath.Join(filepath.Dir(path), "skills.md")
+	skillsPrompt, err := os.ReadFile(skillsPath)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read skills file %q: %w", skillsPath, err)
+	}
+	if err == nil {
+		cfg.SkillsPrompt = string(skillsPrompt)
 	}
 
 	// Sanity fallbacks

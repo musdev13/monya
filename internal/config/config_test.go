@@ -51,6 +51,42 @@ rate_limit = { requests_per_second = 2.0 }
 	}
 }
 
+func TestLoadFromReadsSkillsPromptNextToConfig(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(configPath, []byte(`default_agent = "reviewer"`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const skills = "# Monya\nAnswer clearly and concisely.\n"
+	if err := os.WriteFile(filepath.Join(dir, "skills.md"), []byte(skills), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadFrom(configPath)
+	if err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	if cfg.SkillsPrompt != skills {
+		t.Fatalf("SkillsPrompt = %q, want %q", cfg.SkillsPrompt, skills)
+	}
+}
+
+func TestLoadFromReadsSkillsPromptWithoutConfigFile(t *testing.T) {
+	dir := t.TempDir()
+	const skills = "You are Monya."
+	if err := os.WriteFile(filepath.Join(dir, "skills.md"), []byte(skills), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadFrom(filepath.Join(dir, "config.toml"))
+	if err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	if cfg.SkillsPrompt != skills {
+		t.Fatalf("SkillsPrompt = %q, want %q", cfg.SkillsPrompt, skills)
+	}
+}
+
 func TestLoadFrom_InvalidTOML(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "bad.toml")

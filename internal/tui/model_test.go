@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -386,13 +387,27 @@ func TestFileToolsRunSequentiallyWithoutApproval(t *testing.T) {
 
 func TestChatRequestUsesAgentPromptAndSavedThinkingMode(t *testing.T) {
 	m := New(api.NewClient("", ""), config.Default())
+	m.cfg.SkillsPrompt = "You are Monya."
 	m.activeChat = store.Chat{ID: "chat-1", Thinking: false}
 	m.activeAgent = store.Agent{Name: "Reviewer", SystemPrompt: "Review carefully."}
 	m.history = []api.Message{{Role: "user", Content: "Check this."}}
 
 	req := m.chatRequest()
-	if len(req.Messages) != 2 || req.Messages[0].Role != "system" || req.Messages[0].Content != "Review carefully." {
+	if len(req.Messages) != 2 || req.Messages[0].Role != "system" {
 		t.Fatalf("system prompt missing from request: %+v", req.Messages)
+	}
+	promptParts := strings.SplitN(req.Messages[0].Content, "\n\n", 2)
+	const dateTimePrefix = "Current local date and time (RFC3339): "
+	if !strings.HasPrefix(promptParts[0], dateTimePrefix) {
+		t.Fatalf("current date/time missing from system prompt: %q", promptParts[0])
+	}
+	dateTime := strings.TrimSuffix(strings.TrimPrefix(promptParts[0], dateTimePrefix),
+		". Treat this as authoritative; do not assume a different date or year.")
+	if _, err := time.Parse(time.RFC3339, dateTime); err != nil {
+		t.Fatalf("date/time %q is not RFC3339: %v", dateTime, err)
+	}
+	if len(promptParts) != 2 || promptParts[1] != "You are Monya.\n\nReview carefully." {
+		t.Fatalf("skills and agent prompts missing from request: %q", req.Messages[0].Content)
 	}
 	if req.ChatTemplateKwargs["enable_thinking"] != false {
 		t.Fatalf("thinking mode = %v, want false", req.ChatTemplateKwargs["enable_thinking"])
