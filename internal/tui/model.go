@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -25,6 +26,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
+	"monya/internal/agenttools"
 	"monya/internal/api"
 	"monya/internal/config"
 	"monya/internal/store"
@@ -51,10 +53,13 @@ const (
 	contextSafetyTokens = 64
 )
 
+var safeSedScript = regexp.MustCompile(`^([0-9]+(,[0-9]+)?)?(p|d|q|=|s/[^/;]+/[^/;]*/g?)$`)
+
 type (
 	workspaceLoadedMsg struct {
-		workspace store.Workspace
-		err       error
+		workspace        store.Workspace
+		approvedCommands []string
+		err              error
 	}
 
 	streamStartedMsg struct {
@@ -81,6 +86,12 @@ type (
 		terminalID string
 		input      string
 		err        error
+	}
+	fileToolDoneMsg struct {
+		callID string
+		name   string
+		result string
+		err    error
 	}
 	terminalOutputTickMsg struct{ terminalID string }
 	commandTimeoutMsg     struct{ token int }
@@ -145,8 +156,10 @@ func (i terminalItem) Description() string {
 func (i terminalItem) FilterValue() string { return i.terminal.name + " " + i.terminal.cwd }
 
 type Model struct {
-	client *api.Client
-	cfg    *config.Config
+	client           *api.Client
+	cfg              *config.Config
+	workspaceRoot    string
+	workspaceRootErr error
 
 	state state
 	err   error
@@ -191,11 +204,13 @@ type Model struct {
 	currentReasoning string
 	currentResponse  string
 	currentToolCalls []api.ToolCall
+	toolCallQueue    []api.ToolCall
 
 	// Command execution state
-	pendingToolCall *api.ToolCall
-	pendingCmd      string
-	commandTimedOut bool
+	pendingToolCall  *api.ToolCall
+	pendingCmd       string
+	commandTimedOut  bool
+	approvedCommands map[string]struct{}
 
 	// Clipboard feedback
 	copyStatus      string
@@ -266,19 +281,23 @@ func New(client *api.Client, cfg *config.Config) *Model {
 	sp.Spinner = spinner.Dot
 	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
 
+	workspaceRoot, workspaceRootErr := os.Getwd()
 	m := &Model{
-		client:         client,
-		cfg:            cfg,
-		state:          stateChats,
-		busy:           true,
-		mouseOn:        true,
-		textarea:       ta,
-		viewport:       vp,
-		list:           l,
-		chatTitleInput: ti,
-		agentNameInput: agentName,
-		agentPrompt:    agentPrompt,
-		spinner:        sp,
+		client:           client,
+		cfg:              cfg,
+		workspaceRoot:    workspaceRoot,
+		workspaceRootErr: workspaceRootErr,
+		state:            stateChats,
+		busy:             true,
+		mouseOn:          true,
+		textarea:         ta,
+		viewport:         vp,
+		list:             l,
+		chatTitleInput:   ti,
+		agentNameInput:   agentName,
+		agentPrompt:      agentPrompt,
+		spinner:          sp,
+		approvedCommands: make(map[string]struct{}),
 	}
 	m.terminals = []*terminalEntry{{id: "terminal-1", name: "Terminal 1", starting: true}}
 	m.activeTerminalID = "terminal-1"
@@ -288,6 +307,10 @@ func New(client *api.Client, cfg *config.Config) *Model {
 
 func loadWorkspace(defaultAgent string) tea.Cmd {
 	return func() tea.Msg {
+		approvedCommands, err := config.LoadApprovedCommands()
+		if err != nil {
+			return workspaceLoadedMsg{err: fmt.Errorf("load approved commands: %w", err)}
+		}
 		workspace, err := store.LoadWorkspace()
 		if err != nil {
 			return workspaceLoadedMsg{err: err}
@@ -336,7 +359,7 @@ func loadWorkspace(defaultAgent string) tea.Cmd {
 				return workspaceLoadedMsg{err: err}
 			}
 		}
-		return workspaceLoadedMsg{workspace: workspace}
+		return workspaceLoadedMsg{workspace: workspace, approvedCommands: approvedCommands}
 	}
 }
 
@@ -552,6 +575,22 @@ func (m *Model) chatRequest() api.ChatRequest {
 		reqHistory = append([]api.Message{{Role: "system", Content: m.activeAgent.SystemPrompt}}, reqHistory...)
 	}
 
+	tools := []api.Tool{{
+		Type: "function",
+		Function: api.FunctionDef{
+			Name:        "run_bash",
+			Description: "Выполнить bash-команду в выбранном пользователем терминале Monya и вернуть stdout+stderr. Состояние shell, включая cwd и переменные, сохраняется между вызовами.",
+			Parameters: json.RawMessage(`{
+				"type": "object",
+				"properties": {
+					"command": {"type": "string", "description": "Bash-команда для выполнения"}
+				},
+				"required": ["command"]
+			}`),
+		},
+	}}
+	tools = append(tools, agenttools.Definitions()...)
+
 	return api.ChatRequest{
 		Model:     m.cfg.DefaultModel,
 		MaxTokens: maxResponseTokens,
@@ -560,20 +599,7 @@ func (m *Model) chatRequest() api.ChatRequest {
 		ChatTemplateKwargs: map[string]any{
 			"enable_thinking": m.activeChat.Thinking,
 		},
-		Tools: []api.Tool{{
-			Type: "function",
-			Function: api.FunctionDef{
-				Name:        "run_bash",
-				Description: "Выполнить bash-команду в выбранном пользователем терминале Monya и вернуть stdout+stderr. Состояние shell, включая cwd и переменные, сохраняется между вызовами.",
-				Parameters: json.RawMessage(`{
-					"type": "object",
-					"properties": {
-						"command": {"type": "string", "description": "Bash-команда для выполнения"}
-					},
-					"required": ["command"]
-				}`),
-			},
-		}},
+		Tools: tools,
 	}
 }
 
@@ -726,6 +752,126 @@ func parseRunBashCommand(arguments string) (string, error) {
 		return "", fmt.Errorf("tool arguments do not contain a command")
 	}
 	return args.Command, nil
+}
+
+func isSafeAutoCommand(command string) bool {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return false
+	}
+	fields := strings.Fields(command)
+	if fields[0] == "sed" {
+		return isSafeSedCommand(fields)
+	}
+	if strings.ContainsAny(command, ";&|><`$\\\"'()\n\r*?[]{}!") {
+		return false
+	}
+	switch fields[0] {
+	case "pwd", "whoami", "date", "uname":
+		return len(fields) == 1
+	case "cd":
+		return len(fields) <= 2 && (len(fields) == 1 || !strings.HasPrefix(fields[1], "-"))
+	case "ls":
+		for _, arg := range fields[1:] {
+			if strings.HasPrefix(arg, "-") {
+				return false
+			}
+		}
+		return true
+	case "cat", "head", "tail", "wc", "grep", "rg", "stat", "file":
+		if len(fields) < 2 {
+			return false
+		}
+		for _, arg := range fields[1:] {
+			if arg == "-" || strings.HasPrefix(arg, "-") {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func isSafeSedCommand(fields []string) bool {
+	if strings.ContainsAny(strings.Join(fields, " "), ";&|><`$\\()\n\r*?[]{}!") {
+		return false
+	}
+	args := fields[1:]
+	index := 0
+	for index < len(args) {
+		switch args[index] {
+		case "--sandbox", "-n", "--quiet", "--silent", "-E", "-r", "--regexp-extended":
+			index++
+			continue
+		default:
+			if strings.HasPrefix(args[index], "-") {
+				return false
+			}
+		}
+		break
+	}
+
+	if index >= len(args)-1 {
+		return false
+	}
+	command := args[index]
+	if len(command) >= 2 && ((command[0] == '\'' && command[len(command)-1] == '\'') ||
+		(command[0] == '"' && command[len(command)-1] == '"')) {
+		command = command[1 : len(command)-1]
+	}
+	if strings.ContainsAny(command, "'\"") || !safeSedScript.MatchString(command) {
+		return false
+	}
+	for _, path := range args[index+1:] {
+		if strings.HasPrefix(path, "-") || strings.ContainsAny(path, "'\"") {
+			return false
+		}
+	}
+	return true
+}
+
+func (m *Model) shouldAutoRunCommand(command string) bool {
+	if !m.activeChat.TrustExecution {
+		return false
+	}
+	command = strings.TrimSpace(command)
+	if isSafeAutoCommand(command) {
+		return true
+	}
+	_, ok := m.approvedCommands[command]
+	return ok
+}
+
+func isRememberableCommand(command string) bool {
+	command = strings.TrimSpace(command)
+	return command != "" && !strings.ContainsAny(command, ";&|><`$\\\"'()\n\r*?[]{}!")
+}
+
+func (m *Model) rememberApprovedCommand(command string) error {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return fmt.Errorf("cannot remember an empty command")
+	}
+	if !isRememberableCommand(command) {
+		return fmt.Errorf("commands with shell operators, quotes, or expansions are not remembered")
+	}
+	if m.approvedCommands == nil {
+		m.approvedCommands = make(map[string]struct{})
+	}
+	if _, exists := m.approvedCommands[command]; exists {
+		return nil
+	}
+	commands := make([]string, 0, len(m.approvedCommands)+1)
+	for approved := range m.approvedCommands {
+		commands = append(commands, approved)
+	}
+	commands = append(commands, command)
+	if err := config.SaveApprovedCommands(commands); err != nil {
+		return err
+	}
+	m.approvedCommands[command] = struct{}{}
+	return nil
 }
 
 func renderMarkdown(content string, width int) string {
@@ -1017,6 +1163,43 @@ func (m *Model) updateViewport() {
 
 	m.viewport.SetContent(b.String())
 	m.viewport.GotoBottom()
+}
+
+func (m *Model) codeBlockAtScreenY(y int) (string, bool) {
+	const viewportTop = 2
+	if y < viewportTop || y >= viewportTop+m.viewport.Height {
+		return "", false
+	}
+	line := y - viewportTop + m.viewport.YOffset
+	for _, hit := range m.codeHits {
+		if line >= hit.startLine && line <= hit.endLine {
+			return hit.code, true
+		}
+	}
+	return "", false
+}
+
+func (m *Model) toggleTrustExecution() {
+	oldValue := m.activeChat.TrustExecution
+	m.activeChat.TrustExecution = !oldValue
+	for i := range m.workspace.Chats {
+		if m.workspace.Chats[i].ID == m.activeChat.ID {
+			m.workspace.Chats[i] = m.activeChat
+			break
+		}
+	}
+	if err := store.SaveWorkspace(m.workspace); err != nil {
+		m.activeChat.TrustExecution = oldValue
+		for i := range m.workspace.Chats {
+			if m.workspace.Chats[i].ID == m.activeChat.ID {
+				m.workspace.Chats[i].TrustExecution = oldValue
+				break
+			}
+		}
+		m.chatError = fmt.Sprintf("Save trusted execution setting: %v", err)
+		return
+	}
+	m.chatError = ""
 }
 
 func (m *Model) cycleNewChatAgent(step int) {
@@ -1694,17 +1877,133 @@ func (m *Model) handleTerminalCommandDone(msg terminalCommandDoneMsg) tea.Cmd {
 		}
 		m.persistActiveChat()
 		m.updateViewport()
-		return m.startStream()
+		return m.processNextToolCall()
 	}
 	m.terminalNotice = ""
 	return nil
+}
+
+func (m *Model) processNextToolCall() tea.Cmd {
+	for len(m.toolCallQueue) > 0 {
+		call := m.toolCallQueue[0]
+		m.toolCallQueue = m.toolCallQueue[1:]
+		if call.Type == "" {
+			call.Type = "function"
+		}
+
+		if call.Function.Name == "run_bash" {
+			command, err := parseRunBashCommand(call.Function.Arguments)
+			if err != nil {
+				m.history = append(m.history, api.Message{
+					Role:       "tool",
+					ToolCallID: call.ID,
+					Name:       call.Function.Name,
+					Content:    "Tool call rejected: " + err.Error(),
+				})
+				m.persistActiveChat()
+				m.updateViewport()
+				continue
+			}
+			m.pendingToolCall = &call
+			m.pendingCmd = command
+			m.updateViewport()
+			if m.shouldAutoRunCommand(command) {
+				return m.executePendingToolCall()
+			}
+			return nil
+		}
+
+		if agenttools.IsFileTool(call.Function.Name) {
+			m.history = append(m.history, api.Message{
+				Role:       "tool",
+				ToolCallID: call.ID,
+				Name:       call.Function.Name,
+				Content:    "Working...",
+			})
+			m.persistActiveChat()
+			m.updateViewport()
+			return m.runFileTool(call)
+		}
+
+		m.history = append(m.history, api.Message{
+			Role:       "tool",
+			ToolCallID: call.ID,
+			Name:       call.Function.Name,
+			Content:    "Tool call rejected: unknown tool",
+		})
+		m.persistActiveChat()
+		m.updateViewport()
+	}
+
+	m.persistActiveChat()
+	m.updateViewport()
+	return m.startStream()
+}
+
+func (m *Model) executePendingToolCall() tea.Cmd {
+	if m.pendingToolCall == nil {
+		return nil
+	}
+	cmdStr := m.pendingCmd
+	tcID := m.pendingToolCall.ID
+	entry := m.activeTerminal()
+	m.history = append(m.history, api.Message{
+		Role:       "tool",
+		ToolCallID: tcID,
+		Name:       "run_bash",
+		Content:    "Executing...",
+	})
+	m.pendingToolCall = nil
+	m.commandTimedOut = false
+	if entry == nil || entry.session == nil {
+		m.history[len(m.history)-1].Content = "No active terminal session is available."
+		m.persistActiveChat()
+		m.updateViewport()
+		return m.processNextToolCall()
+	}
+	m.commandRunning = true
+	m.commandTerminalID = entry.id
+	m.commandTimeoutID++
+	timeoutID := m.commandTimeoutID
+	m.textarea.SetValue("")
+	m.textarea.Placeholder = "Input to the running terminal..."
+	m.appendTerminalOutput(entry, "[Monya] $ "+cmdStr)
+	m.persistActiveChat()
+	execCmd := executeTerminalCommand(entry.id, entry.session, cmdStr, true)
+	timerCmd := tea.Tick(30*time.Second, func(time.Time) tea.Msg {
+		return commandTimeoutMsg{token: timeoutID}
+	})
+	m.updateViewport()
+	return tea.Batch(execCmd, terminalOutputTick(entry.id), timerCmd)
+}
+
+func (m *Model) runFileTool(call api.ToolCall) tea.Cmd {
+	rootPath := m.workspaceRoot
+	rootErr := m.workspaceRootErr
+	return func() tea.Msg {
+		if rootErr != nil {
+			return fileToolDoneMsg{
+				callID: call.ID,
+				name:   call.Function.Name,
+				err:    fmt.Errorf("determine project root: %w", rootErr),
+			}
+		}
+		result, err := agenttools.Execute(rootPath, call.Function.Name, call.Function.Arguments)
+		return fileToolDoneMsg{
+			callID: call.ID,
+			name:   call.Function.Name,
+			result: result,
+			err:    err,
+		}
+	}
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.viewport.Width = max(1, msg.Width-2)
-		m.viewport.Height = max(1, msg.Height-12)
+		statusRows := lipgloss.Height(m.chatStatusLine())
+		m.viewport.Height = max(1, msg.Height-10-statusRows)
 		m.textarea.SetWidth(max(1, msg.Width-4))
 		m.agentPrompt.SetWidth(max(1, msg.Width-4))
 		m.agentPrompt.SetHeight(max(1, msg.Height-12))
@@ -1755,6 +2054,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.workspace = msg.workspace
+		m.approvedCommands = make(map[string]struct{}, len(msg.approvedCommands))
+		for _, command := range msg.approvedCommands {
+			command = strings.TrimSpace(command)
+			if command != "" {
+				m.approvedCommands[command] = struct{}{}
+			}
+		}
 		m.err = nil
 		m.state = stateChats
 		m.list.Title = "Monya — Chats"
@@ -1786,6 +2092,20 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case terminalCommandDoneMsg:
 		return m, m.handleTerminalCommandDone(msg)
+
+	case fileToolDoneMsg:
+		last := len(m.history) - 1
+		if last < 0 || m.history[last].Role != "tool" ||
+			m.history[last].ToolCallID != msg.callID || m.history[last].Name != msg.name {
+			m.chatError = fmt.Sprintf("Unexpected result from file tool %q", msg.name)
+			return m, nil
+		}
+		content := msg.result
+		if msg.err != nil {
+			content = "File tool failed: " + msg.err.Error()
+		}
+		m.history[last].Content = content
+		return m, m.processNextToolCall()
 
 	case terminalInputDoneMsg:
 		m.terminalInputPending = false
@@ -1850,14 +2170,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg := msg.(type) {
 		case tea.MouseMsg:
 			if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
-				const viewportTop = 3
-				if msg.Y >= viewportTop && msg.Y < viewportTop+m.viewport.Height {
-					rel := msg.Y - viewportTop + m.viewport.YOffset
-					for _, h := range m.codeHits {
-						if rel >= h.startLine && rel <= h.endLine {
-							return m, m.copyText(h.code, "Code block copied to clipboard")
-						}
-					}
+				if code, ok := m.codeBlockAtScreenY(msg.Y); ok {
+					return m, m.copyText(code, "Code block copied to clipboard")
 				}
 			}
 			var cmd tea.Cmd
@@ -1873,38 +2187,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.pendingToolCall != nil {
 				switch msg.String() {
 				case "y", "Y", "enter":
-					cmdStr := m.pendingCmd
-					tcID := m.pendingToolCall.ID
-					entry := m.activeTerminal()
-
-					m.history = append(m.history, api.Message{
-						Role:       "tool",
-						ToolCallID: tcID,
-						Name:       "run_bash",
-						Content:    "Executing...",
-					})
-					m.pendingToolCall = nil
-					m.commandTimedOut = false
-					if entry == nil || entry.session == nil {
-						m.history[len(m.history)-1].Content = "No active terminal session is available."
-						m.persistActiveChat()
-						m.updateViewport()
-						return m, m.startStream()
+					var rememberErr error
+					if m.activeChat.TrustExecution && isRememberableCommand(m.pendingCmd) {
+						rememberErr = m.rememberApprovedCommand(m.pendingCmd)
 					}
-					m.commandRunning = true
-					m.commandTerminalID = entry.id
-					m.commandTimeoutID++
-					timeoutID := m.commandTimeoutID
-					m.textarea.SetValue("")
-					m.textarea.Placeholder = "Input to the running terminal..."
-					m.appendTerminalOutput(entry, "[Monya] $ "+cmdStr)
-					m.persistActiveChat()
-					execCmd := executeTerminalCommand(entry.id, entry.session, cmdStr, true)
-					timerCmd := tea.Tick(30*time.Second, func(t time.Time) tea.Msg {
-						return commandTimeoutMsg{token: timeoutID}
-					})
-					m.updateViewport()
-					return m, tea.Batch(execCmd, terminalOutputTick(entry.id), timerCmd)
+					cmd := m.executePendingToolCall()
+					if rememberErr != nil {
+						m.chatError = fmt.Sprintf("Save approved command: %v", rememberErr)
+					}
+					return m, cmd
 				case "n", "N", "esc":
 					tcID := m.pendingToolCall.ID
 					m.history = append(m.history, api.Message{
@@ -1915,7 +2206,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					})
 					m.pendingToolCall = nil
 					m.persistActiveChat()
-					return m, m.startStream()
+					return m, m.processNextToolCall()
 				}
 				return m, nil
 			}
@@ -1987,6 +2278,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else {
 					m.chatError = ""
 				}
+				return m, nil
+			}
+			if msg.String() == "f4" && !m.isStreaming && m.pendingToolCall == nil {
+				m.toggleTrustExecution()
 				return m, nil
 			}
 			if msg.String() == "ctrl+t" && !m.isStreaming {
@@ -2075,27 +2370,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					ToolCalls:        m.currentToolCalls,
 				})
 				m.persistActiveChat()
-
-				tc := m.currentToolCalls[0]
+				m.toolCallQueue = append(m.toolCallQueue[:0], m.currentToolCalls...)
 				m.currentReasoning = ""
 				m.currentResponse = ""
 				m.currentToolCalls = nil
-
-				command, err := parseRunBashCommand(tc.Function.Arguments)
-				if err != nil {
-					m.history = append(m.history, api.Message{
-						Role:       "tool",
-						ToolCallID: tc.ID,
-						Name:       tc.Function.Name,
-						Content:    "Tool call rejected: " + err.Error(),
-					})
-					m.persistActiveChat()
-					m.updateViewport()
-					return m, m.startStream()
-				}
-				m.pendingToolCall = &tc
-				m.pendingCmd = command
-				m.updateViewport()
+				return m, m.processNextToolCall()
 			} else {
 				if m.currentResponse != "" || m.currentReasoning != "" {
 					m.history = append(m.history, api.Message{
@@ -2297,7 +2576,13 @@ func (m *Model) viewChat() string {
 	} else if m.pendingToolCall != nil {
 		b.WriteString(dimStyle.Render(fmt.Sprintf("Execute in %s: %s ?", m.activeTerminalName(), m.pendingCmd)))
 		b.WriteString("\n")
-		b.WriteString(helpStyle.Render("[enter/y]es  [n]o"))
+		if m.activeChat.TrustExecution && isRememberableCommand(m.pendingCmd) {
+			b.WriteString(helpStyle.Render("[enter/y] approve & remember exact command  [n]o"))
+		} else if m.activeChat.TrustExecution {
+			b.WriteString(helpStyle.Render("[enter/y] run once (cannot remember shell syntax)  [n]o"))
+		} else {
+			b.WriteString(helpStyle.Render("[enter/y] run once  [n]o"))
+		}
 	} else if m.isStreaming {
 		b.WriteString(fmt.Sprintf("%s Streaming... [esc] to cancel", m.spinner.View()))
 	} else {
@@ -2306,7 +2591,7 @@ func (m *Model) viewChat() string {
 		if m.mouseOn {
 			mouseState = "on"
 		}
-		b.WriteString("\n" + helpStyle.Render("[enter] send  [ctrl+j] newline  [ctrl+y] copy answer  [ctrl+b] copy code  [click block] copy  [pgup/pgdown] scroll  [f2] mouse:"+mouseState+"  [f3] thinking toggle  [ctrl+t] terminals  [esc] back"))
+		b.WriteString("\n" + helpStyle.Render("[enter] send  [ctrl+j] newline  [ctrl+y] copy answer  [ctrl+b] copy code  [click block] copy  [pgup/pgdown] scroll  [f2] mouse:"+mouseState+"  [f3] thinking  [f4] trusted execution  [ctrl+t] terminals  [esc] back"))
 	}
 	if m.copyStatus != "" {
 		b.WriteString("\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Render("✓ "+m.copyStatus))
@@ -2352,10 +2637,24 @@ func (m *Model) chatStatusLine() string {
 	if !m.activeChat.Thinking {
 		thinking = ansi.Wrap(thinkingBadge.Render("THINKING OFF"), width, "")
 	}
+	executionBadge := lipgloss.NewStyle().Bold(true).Padding(0, 1)
+	executionLabel := "TRUST EXEC OFF"
+	if m.activeChat.TrustExecution {
+		executionBadge = executionBadge.Foreground(lipgloss.Color("0")).Background(lipgloss.Color("214"))
+		executionLabel = "TRUST EXEC ON"
+	} else {
+		executionBadge = executionBadge.Foreground(lipgloss.Color("15")).Background(lipgloss.Color("238"))
+	}
+	execution := ansi.Wrap(executionBadge.Render(executionLabel), width, "")
 	terminalBadge := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Background(lipgloss.Color("24"))
 	activeTerminal := ansi.Wrap(terminalBadge.Render("TERMINAL: "+m.activeTerminalName()), width, "")
-	if lipgloss.Width(thinking)+2+lipgloss.Width(activeTerminal) > width {
-		return thinking + "\n" + activeTerminal
+	badges := []string{thinking, execution, activeTerminal}
+	totalWidth := 0
+	for _, badge := range badges {
+		totalWidth += lipgloss.Width(badge)
 	}
-	return thinking + "  " + activeTerminal
+	if totalWidth+2*(len(badges)-1) > width {
+		return strings.Join(badges, "\n")
+	}
+	return strings.Join(badges, "  ")
 }

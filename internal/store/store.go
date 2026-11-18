@@ -20,12 +20,13 @@ type Agent struct {
 }
 
 type Chat struct {
-	ID         string    `json:"id"`
-	Title      string    `json:"title"`
-	AgentID    string    `json:"agent_id"`
-	Thinking   bool      `json:"thinking"`
-	UpdatedAt  time.Time `json:"updated_at"`
-	LegacyName string    `json:"legacy_name,omitempty"`
+	ID             string    `json:"id"`
+	Title          string    `json:"title"`
+	AgentID        string    `json:"agent_id"`
+	Thinking       bool      `json:"thinking"`
+	TrustExecution bool      `json:"trust_execution"`
+	UpdatedAt      time.Time `json:"updated_at"`
+	LegacyName     string    `json:"legacy_name,omitempty"`
 }
 
 type Workspace struct {

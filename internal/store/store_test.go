@@ -17,7 +17,7 @@ func TestWorkspaceAndChatHistoryPersist(t *testing.T) {
 	}
 	workspace := Workspace{
 		Agents: []Agent{{ID: "agent-1", Name: "Helper", SystemPrompt: "Be helpful."}},
-		Chats:  []Chat{{ID: id, Title: "First chat", AgentID: "agent-1", Thinking: false}},
+		Chats:  []Chat{{ID: id, Title: "First chat", AgentID: "agent-1", Thinking: false, TrustExecution: true}},
 	}
 	if err := SaveWorkspace(workspace); err != nil {
 		t.Fatalf("SaveWorkspace: %v", err)
@@ -34,7 +34,7 @@ func TestWorkspaceAndChatHistoryPersist(t *testing.T) {
 	if len(gotWorkspace.Agents) != 1 || gotWorkspace.Agents[0].SystemPrompt != "Be helpful." {
 		t.Fatalf("agents did not persist: %+v", gotWorkspace.Agents)
 	}
-	if len(gotWorkspace.Chats) != 1 || gotWorkspace.Chats[0].Thinking {
+	if len(gotWorkspace.Chats) != 1 || gotWorkspace.Chats[0].Thinking || !gotWorkspace.Chats[0].TrustExecution {
 		t.Fatalf("chat settings did not persist: %+v", gotWorkspace.Chats)
 	}
 	gotMessages, err := LoadChatHistory(id)

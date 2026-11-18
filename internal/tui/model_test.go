@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -29,6 +31,9 @@ func TestWindowSizeClampsViewportForShortTerminal(t *testing.T) {
 
 func TestLoadWorkspacePersistsDefaultAgentAndChat(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
+	if err := config.SaveApprovedCommands([]string{"docker ps"}); err != nil {
+		t.Fatalf("SaveApprovedCommands: %v", err)
+	}
 
 	msg := loadWorkspace("local-agent")()
 	loaded, ok := msg.(workspaceLoadedMsg)
@@ -43,6 +48,9 @@ func TestLoadWorkspacePersistsDefaultAgentAndChat(t *testing.T) {
 	}
 	if len(loaded.workspace.Chats) != 1 {
 		t.Fatalf("chats = %+v, want one default chat", loaded.workspace.Chats)
+	}
+	if len(loaded.approvedCommands) != 1 || loaded.approvedCommands[0] != "docker ps" {
+		t.Fatalf("approved commands = %v, want docker ps", loaded.approvedCommands)
 	}
 	second := loadWorkspace("local-agent")().(workspaceLoadedMsg)
 	if second.err != nil {
@@ -82,6 +90,300 @@ func TestThinkingTogglePersistsForCurrentChat(t *testing.T) {
 	}
 }
 
+func TestTrustedExecutionTogglePersistsForCurrentChat(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	m := New(api.NewClient("", ""), config.Default())
+	m.state = stateChat
+	m.workspace = store.Workspace{
+		Agents: []store.Agent{{ID: "agent-1", Name: "Helper"}},
+		Chats:  []store.Chat{{ID: "chat-1", Title: "Test", AgentID: "agent-1"}},
+	}
+	m.activeChat = m.workspace.Chats[0]
+	m.activeAgent = m.workspace.Agents[0]
+	_, _ = m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyF4})
+
+	if !m.activeChat.TrustExecution {
+		t.Fatal("trusted execution should be enabled")
+	}
+	if !strings.Contains(m.chatStatusLine(), "TRUST EXEC ON") {
+		t.Fatal("trusted execution status is not visible")
+	}
+	workspace, err := store.LoadWorkspace()
+	if err != nil {
+		t.Fatalf("LoadWorkspace: %v", err)
+	}
+	if len(workspace.Chats) != 1 || !workspace.Chats[0].TrustExecution {
+		t.Fatalf("trusted execution mode was not persisted: %+v", workspace.Chats)
+	}
+}
+
+func TestTrustedExecutionAutoRunsOnlySafeCommands(t *testing.T) {
+	for _, test := range []struct {
+		command string
+		want    bool
+	}{
+		{command: "pwd", want: true},
+		{command: "cd /tmp", want: true},
+		{command: "ls src", want: true},
+		{command: "cat internal/tui/model.go", want: true},
+		{command: "grep package internal/tui/model.go", want: true},
+		{command: "sed -n '1,10p' internal/tui/model.go", want: true},
+		{command: "sed --sandbox -n 1,10p internal/tui/model.go", want: true},
+		{command: "sed -i s/old/new/ file", want: false},
+		{command: "sed --sandbox -n e file", want: false},
+		{command: "ls -la", want: false},
+		{command: "cat", want: false},
+		{command: "rm -rf build", want: false},
+		{command: "ls; curl example.com", want: false},
+		{command: "pwd $(whoami)", want: false},
+	} {
+		if got := isSafeAutoCommand(test.command); got != test.want {
+			t.Errorf("isSafeAutoCommand(%q) = %v, want %v", test.command, got, test.want)
+		}
+	}
+}
+
+func TestTrustedExecutionStartsSafeToolWithoutConfirmation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	session, err := terminal.Start()
+	if err != nil {
+		t.Fatalf("terminal.Start: %v", err)
+	}
+	defer session.Close()
+
+	chat := store.Chat{
+		ID:             strings.Repeat("a", 32),
+		Title:          "Test",
+		AgentID:        "agent-1",
+		TrustExecution: true,
+	}
+	m := New(api.NewClient("", ""), config.Default())
+	m.state = stateChat
+	m.workspace = store.Workspace{
+		Agents: []store.Agent{{ID: "agent-1", Name: "Helper"}},
+		Chats:  []store.Chat{chat},
+	}
+	m.activeChat = chat
+	m.activeAgent = m.workspace.Agents[0]
+	m.terminals = []*terminalEntry{{id: "terminal-1", name: "Terminal 1", session: session}}
+	m.activeTerminalID = "terminal-1"
+	m.currentToolCalls = []api.ToolCall{{
+		ID:       "tool-1",
+		Type:     "function",
+		Function: api.FunctionArg{Name: "run_bash", Arguments: `{"command":"pwd"}`},
+	}}
+
+	_, cmd := m.Update(streamDoneMsg{})
+
+	if m.pendingToolCall != nil || !m.commandRunning {
+		t.Fatalf("safe command was not started automatically: pending=%v running=%v", m.pendingToolCall, m.commandRunning)
+	}
+	if cmd == nil {
+		t.Fatal("automatic execution did not start any command")
+	}
+}
+
+func TestRememberedCommandsMustBeLiteral(t *testing.T) {
+	for _, test := range []struct {
+		command string
+		want    bool
+	}{
+		{command: "docker ps", want: true},
+		{command: "go test ./...", want: true},
+		{command: "docker ps && echo done", want: false},
+		{command: "cat $HOME/.ssh/id_rsa", want: false},
+		{command: `echo "hello"`, want: false},
+	} {
+		if got := isRememberableCommand(test.command); got != test.want {
+			t.Errorf("isRememberableCommand(%q) = %v, want %v", test.command, got, test.want)
+		}
+	}
+}
+
+func TestTrustedExecutionRemembersExactApprovedCommand(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	session, err := terminal.Start()
+	if err != nil {
+		t.Fatalf("terminal.Start: %v", err)
+	}
+	defer session.Close()
+
+	chat := store.Chat{
+		ID:             strings.Repeat("b", 32),
+		Title:          "Test",
+		AgentID:        "agent-1",
+		TrustExecution: true,
+	}
+	m := New(api.NewClient("", ""), config.Default())
+	m.state = stateChat
+	m.workspace = store.Workspace{
+		Agents: []store.Agent{{ID: "agent-1", Name: "Helper"}},
+		Chats:  []store.Chat{chat},
+	}
+	m.activeChat = chat
+	m.activeAgent = m.workspace.Agents[0]
+	m.terminals = []*terminalEntry{{id: "terminal-1", name: "Terminal 1", session: session}}
+	m.activeTerminalID = "terminal-1"
+	m.currentToolCalls = []api.ToolCall{{
+		ID:       "tool-1",
+		Type:     "function",
+		Function: api.FunctionArg{Name: "run_bash", Arguments: `{"command":"docker ps"}`},
+	}}
+
+	_, _ = m.Update(streamDoneMsg{})
+	if m.pendingToolCall == nil || m.commandRunning {
+		t.Fatalf("unapproved command should wait for confirmation: pending=%v running=%v", m.pendingToolCall, m.commandRunning)
+	}
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	if !m.commandRunning || cmd == nil {
+		t.Fatal("approved command did not start")
+	}
+	if !m.shouldAutoRunCommand("docker ps") {
+		t.Fatal("the exact approved command was not remembered")
+	}
+	if m.shouldAutoRunCommand("docker ps -a") {
+		t.Fatal("a different command was implicitly approved")
+	}
+	m.activeChat.TrustExecution = false
+	if m.shouldAutoRunCommand("docker ps") {
+		t.Fatal("saved approvals must not bypass confirmation when trusted execution is off")
+	}
+	saved, err := config.LoadApprovedCommands()
+	if err != nil {
+		t.Fatalf("LoadApprovedCommands: %v", err)
+	}
+	if len(saved) != 1 || saved[0] != "docker ps" {
+		t.Fatalf("saved approved commands = %v, want exact docker ps command", saved)
+	}
+}
+
+func TestReadFileToolRunsWithoutCommandApproval(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	project := t.TempDir()
+	if err := os.WriteFile(filepath.Join(project, "notes.txt"), []byte("hello from project\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	chat := store.Chat{
+		ID:      strings.Repeat("c", 32),
+		Title:   "Test",
+		AgentID: "agent-1",
+	}
+	m := New(api.NewClient("", ""), config.Default())
+	m.state = stateChat
+	m.workspaceRoot = project
+	m.workspace = store.Workspace{
+		Agents: []store.Agent{{ID: "agent-1", Name: "Helper"}},
+		Chats:  []store.Chat{chat},
+	}
+	m.activeChat = chat
+	m.activeAgent = m.workspace.Agents[0]
+	m.currentToolCalls = []api.ToolCall{{
+		ID:   "file-call",
+		Type: "function",
+		Function: api.FunctionArg{
+			Name:      "read_file",
+			Arguments: `{"path":"notes.txt"}`,
+		},
+	}}
+
+	_, cmd := m.Update(streamDoneMsg{})
+	if m.pendingToolCall != nil || m.commandRunning {
+		t.Fatal("read_file incorrectly entered the shell approval flow")
+	}
+	if cmd == nil {
+		t.Fatal("read_file did not start")
+	}
+	msg := cmd()
+	result, ok := msg.(fileToolDoneMsg)
+	if !ok {
+		t.Fatalf("file tool returned %T, want fileToolDoneMsg", msg)
+	}
+	if result.err != nil || !strings.Contains(result.result, "hello from project") {
+		t.Fatalf("file tool result = %+v", result)
+	}
+
+	_, _ = m.Update(result)
+	if got := m.history[len(m.history)-1].Content; !strings.Contains(got, "hello from project") {
+		t.Fatalf("tool result was not added to chat history: %q", got)
+	}
+}
+
+func TestFileToolsRunSequentiallyWithoutApproval(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	project := t.TempDir()
+	if err := os.WriteFile(filepath.Join(project, "source.txt"), []byte("read first\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	chat := store.Chat{
+		ID:      strings.Repeat("d", 32),
+		Title:   "Test",
+		AgentID: "agent-1",
+	}
+	m := New(api.NewClient("", ""), config.Default())
+	m.state = stateChat
+	m.workspaceRoot = project
+	m.workspace = store.Workspace{
+		Agents: []store.Agent{{ID: "agent-1", Name: "Helper"}},
+		Chats:  []store.Chat{chat},
+	}
+	m.activeChat = chat
+	m.activeAgent = m.workspace.Agents[0]
+	m.currentToolCalls = []api.ToolCall{
+		{
+			ID:       "read-call",
+			Type:     "function",
+			Function: api.FunctionArg{Name: "read_file", Arguments: `{"path":"source.txt"}`},
+		},
+		{
+			ID:       "create-call",
+			Type:     "function",
+			Function: api.FunctionArg{Name: "create_file", Arguments: `{"path":"new.txt","content":"created second"}`},
+		},
+	}
+
+	_, cmd := m.Update(streamDoneMsg{})
+	if m.pendingToolCall != nil || cmd == nil {
+		t.Fatal("file tools unexpectedly required approval or did not start")
+	}
+	first := cmd().(fileToolDoneMsg)
+	_, cmd = m.Update(first)
+	if cmd == nil {
+		t.Fatal("second file tool did not start")
+	}
+	second := cmd().(fileToolDoneMsg)
+	_, _ = m.Update(second)
+	if m.pendingToolCall != nil || !m.isStreaming {
+		t.Fatalf("file tools did not complete before resuming the model: pending=%v streaming=%v", m.pendingToolCall, m.isStreaming)
+	}
+
+	if got, err := os.ReadFile(filepath.Join(project, "new.txt")); err != nil || string(got) != "created second" {
+		t.Fatalf("created file = %q, err=%v", got, err)
+	}
+	var readResult, createResult string
+	for _, message := range m.history {
+		if message.Role != "tool" {
+			continue
+		}
+		switch message.Name {
+		case "read_file":
+			readResult = message.Content
+		case "create_file":
+			createResult = message.Content
+		}
+	}
+	if !strings.Contains(readResult, "1: read first") {
+		t.Fatalf("read_file result = %q", readResult)
+	}
+	if !strings.Contains(createResult, "Created new.txt") {
+		t.Fatalf("create_file result = %q", createResult)
+	}
+}
+
 func TestChatRequestUsesAgentPromptAndSavedThinkingMode(t *testing.T) {
 	m := New(api.NewClient("", ""), config.Default())
 	m.activeChat = store.Chat{ID: "chat-1", Thinking: false}
@@ -97,6 +399,10 @@ func TestChatRequestUsesAgentPromptAndSavedThinkingMode(t *testing.T) {
 	}
 	if req.MaxTokens != maxResponseTokens {
 		t.Fatalf("max_tokens = %d, want %d", req.MaxTokens, maxResponseTokens)
+	}
+	if len(req.Tools) != 3 || req.Tools[0].Function.Name != "run_bash" ||
+		req.Tools[1].Function.Name != "read_file" || req.Tools[2].Function.Name != "create_file" {
+		t.Fatalf("tools = %+v, want run_bash, read_file, create_file", req.Tools)
 	}
 }
 
@@ -114,14 +420,14 @@ func TestChatViewShowsThinkingAndSelectedTerminal(t *testing.T) {
 	_, _ = m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 
 	view := m.viewChat()
-	for _, status := range []string{"THINKING ON", "TERMINAL: Terminal 1"} {
+	for _, status := range []string{"THINKING ON", "TRUST EXEC OFF", "TERMINAL: Terminal 1"} {
 		if !strings.Contains(view, status) {
 			t.Fatalf("chat view does not show %q: %s", status, view)
 		}
 	}
 	m.isStreaming = true
 	view = m.viewChat()
-	for _, status := range []string{"THINKING ON", "TERMINAL: Terminal 1"} {
+	for _, status := range []string{"THINKING ON", "TRUST EXEC OFF", "TERMINAL: Terminal 1"} {
 		if !strings.Contains(view, status) {
 			t.Fatalf("streaming chat view does not show %q: %s", status, view)
 		}
@@ -146,6 +452,29 @@ func TestChatStatusLineWrapsWithinNarrowWindow(t *testing.T) {
 		if width := lipgloss.Width(line); width > m.viewport.Width {
 			t.Fatalf("status line width %d exceeds viewport width %d: %q", width, m.viewport.Width, line)
 		}
+	}
+}
+
+func TestCodeBlockClickUsesViewportScreenCoordinates(t *testing.T) {
+	m := New(api.NewClient("", ""), config.Default())
+	m.state = stateChat
+	m.viewport.Width = 80
+	m.viewport.Height = 30
+	m.history = []api.Message{{
+		Role:    "assistant",
+		Content: "```go\nfmt.Println(\"hello\")\n```",
+	}}
+	m.updateViewport()
+
+	if len(m.codeHits) != 1 {
+		t.Fatalf("code hits = %d, want one", len(m.codeHits))
+	}
+	code, ok := m.codeBlockAtScreenY(2 + m.codeHits[0].startLine)
+	if !ok {
+		t.Fatal("clicking the code block's top border did not hit it")
+	}
+	if code != "fmt.Println(\"hello\")" {
+		t.Fatalf("clicked code = %q", code)
 	}
 }
 

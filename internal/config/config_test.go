@@ -90,3 +90,27 @@ rate_limit = { requests_per_second = -5, max_concurrent = 0, burst = 0 }
 		t.Errorf("MaxConcurrent fallback failed: %d", cfg.RateLimit.MaxConcurrent)
 	}
 }
+
+func TestApprovedCommandsPersist(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	commands, err := LoadApprovedCommands()
+	if err != nil {
+		t.Fatalf("LoadApprovedCommands for missing file: %v", err)
+	}
+	if len(commands) != 0 {
+		t.Fatalf("commands = %v, want empty", commands)
+	}
+
+	want := []string{"docker ps", "go test ./..."}
+	if err := SaveApprovedCommands(want); err != nil {
+		t.Fatalf("SaveApprovedCommands: %v", err)
+	}
+	got, err := LoadApprovedCommands()
+	if err != nil {
+		t.Fatalf("LoadApprovedCommands: %v", err)
+	}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("commands = %v, want %v", got, want)
+	}
+}
