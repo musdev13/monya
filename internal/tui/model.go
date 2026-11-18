@@ -23,6 +23,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"monya/internal/api"
 	"monya/internal/config"
@@ -236,6 +237,7 @@ func New(client *api.Client, cfg *config.Config) *Model {
 		if l.Title == "Monya — Terminals" {
 			return []key.Binding{
 				key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "new terminal")),
+				key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "select for Monya")),
 				key.NewBinding(key.WithKeys("d"), key.WithHelp("d", "close terminal")),
 				key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "restart unavailable")),
 			}
@@ -726,12 +728,25 @@ func parseRunBashCommand(arguments string) (string, error) {
 	return args.Command, nil
 }
 
-func renderMarkdown(content string) string {
-	r, err := glamour.Render(content, "dark")
+func renderMarkdown(content string, width int) string {
+	width = max(1, width)
+	renderer, err := glamour.NewTermRenderer(
+		glamour.WithStylePath("dark"),
+		glamour.WithWordWrap(width),
+	)
 	if err != nil {
-		return content
+		return wrapText(content, width)
 	}
-	return r
+	rendered, err := renderer.Render(content)
+	if err != nil {
+		return wrapText(content, width)
+	}
+	return ansi.Wrap(rendered, width, "")
+}
+
+func wrapText(content string, width int) string {
+	width = max(1, width)
+	return ansi.Wrap(content, width, "")
 }
 
 // extractCodeBlocks returns the contents of all fenced code blocks in md.
@@ -812,40 +827,44 @@ func splitMarkdown(md string) []mdSegment {
 // renderCodeBox draws a fenced code block inside a rounded frame with a
 // [copy] label in the top border. The whole frame is clickable.
 func renderCodeBox(code, lang string, width int) string {
-	inner := width - 4
-	if inner < 10 {
-		inner = 10
+	width = max(1, width)
+	if width < 5 {
+		return wrapText(code, width) + "\n"
 	}
+	inner := width - 4
 	label := "[copy]"
 	if lang != "" {
 		label = "[" + lang + "] copy"
 	}
-	fill := width - 3 - utf8.RuneCountInString(label)
-	if fill < 0 {
-		fill = 0
+	if utf8.RuneCountInString(label) > width-3 {
+		label = ""
 	}
+	fill := width - 3 - utf8.RuneCountInString(label)
 	var b strings.Builder
 	b.WriteString("╭" + "─" + label + strings.Repeat("─", fill) + "╮" + "\n")
 	for _, ln := range strings.Split(code, "\n") {
-		ln = strings.ReplaceAll(ln, "\t", " ")
-		r := []rune(ln)
-		if len(r) > inner {
-			r = r[:inner]
-			ln = string(r)
+		for _, wrapped := range wrapCodeLine(ln, inner) {
+			padding := inner - lipgloss.Width(wrapped)
+			if padding < 0 {
+				padding = 0
+			}
+			b.WriteString("│" + " " + wrapped + strings.Repeat(" ", padding) + " " + "│" + "\n")
 		}
-		b.WriteString("│" + " " + ln + strings.Repeat(" ", inner-len(r)) + " " + "│" + "\n")
 	}
 	b.WriteString("╰" + strings.Repeat("─", inner+2) + "╯" + "\n")
 	return b.String()
 }
 
+func wrapCodeLine(line string, width int) []string {
+	width = max(1, width)
+	line = strings.ReplaceAll(line, "\t", "    ")
+	return strings.Split(ansi.Hardwrap(line, width, true), "\n")
+}
+
 // renderAssistant renders an assistant message, drawing each fenced code
 // block as a clickable framed box.
 func (m Model) renderAssistant(content string) (string, []codeBlockHit) {
-	width := m.viewport.Width
-	if width < 30 {
-		width = 30
-	}
+	width := max(1, m.viewport.Width)
 	var b strings.Builder
 	line := 0
 	var hits []codeBlockHit
@@ -862,7 +881,7 @@ func (m Model) renderAssistant(content string) (string, []codeBlockHit) {
 		if t == "" {
 			continue
 		}
-		r := renderMarkdown(t)
+		r := renderMarkdown(t, width)
 		if !strings.HasSuffix(r, "\n") {
 			r += "\n"
 		}
@@ -951,6 +970,7 @@ func (m *Model) copyLastCode() tea.Cmd {
 func (m *Model) updateViewport() {
 	var b strings.Builder
 	line := 0
+	wrapWidth := max(1, m.viewport.Width)
 	m.codeHits = nil
 	add := func(s string) {
 		b.WriteString(s)
@@ -969,10 +989,10 @@ func (m *Model) updateViewport() {
 	for _, msg := range m.history {
 		switch msg.Role {
 		case "user":
-			add(userStyle.Render("User: "+msg.Content) + "\n")
+			add(userStyle.Render(wrapText("User: "+msg.Content, wrapWidth)) + "\n")
 		case "assistant":
 			if msg.ReasoningContent != "" {
-				add(reasoningStyle.Render("Thoughts:\n"+msg.ReasoningContent) + "\n\n")
+				add(reasoningStyle.Render("Thoughts:\n"+wrapText(msg.ReasoningContent, wrapWidth)) + "\n\n")
 			}
 			add("Assistant:\n")
 			if msg.Content != "" {
@@ -980,14 +1000,14 @@ func (m *Model) updateViewport() {
 			}
 			add("\n")
 		case "tool":
-			add(toolStyle.Render(fmt.Sprintf("Tool (%s): %s", msg.Name, msg.Content)) + "\n")
+			add(toolStyle.Render(wrapText(fmt.Sprintf("Tool (%s): %s", msg.Name, msg.Content), wrapWidth)) + "\n")
 		}
 		add("\n")
 	}
 
 	if m.isStreaming {
 		if m.currentReasoning != "" {
-			add(dimStyle.Render(m.currentReasoning) + "\n\n")
+			add(dimStyle.Render(wrapText(m.currentReasoning, wrapWidth)) + "\n\n")
 		}
 		if m.currentResponse != "" {
 			add("Assistant:\n")
@@ -1195,6 +1215,25 @@ func (m *Model) updateTerminalList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if item, ok := m.list.SelectedItem().(terminalItem); ok {
 				m.openTerminalScreen(item.terminal)
 				return m, nil
+			}
+		case "s":
+			if item, ok := m.list.SelectedItem().(terminalItem); ok {
+				entry := item.terminal
+				if entry.starting || entry.session == nil {
+					m.terminalNotice = "This terminal is not ready to be selected."
+					return m, nil
+				}
+				m.activeTerminalID = entry.id
+				m.state = m.terminalReturnState
+				m.list.Title = "Monya — Chats"
+				m.list.ResetFilter()
+				m.terminalNotice = ""
+				if m.state == stateChat {
+					m.textarea.Placeholder = "Type a message..."
+					m.textarea.Focus()
+					m.updateViewport()
+				}
+				return m, m.list.SetItems(m.chatListItems())
 			}
 		case "d":
 			if item, ok := m.list.SelectedItem().(terminalItem); ok {
@@ -1665,11 +1704,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.viewport.Width = max(1, msg.Width-2)
-		m.viewport.Height = max(1, msg.Height-10)
+		m.viewport.Height = max(1, msg.Height-12)
 		m.textarea.SetWidth(max(1, msg.Width-4))
 		m.agentPrompt.SetWidth(max(1, msg.Width-4))
 		m.agentPrompt.SetHeight(max(1, msg.Height-12))
-		m.list.SetSize(max(1, msg.Width), max(1, msg.Height-4)) // leave space for custom footer
+		m.list.SetSize(max(1, msg.Width), max(1, msg.Height-5)) // leave space for custom footer
 		if m.state == stateTerminal {
 			if entry := m.activeTerminal(); entry != nil {
 				m.updateTerminalViewport(entry)
@@ -2108,7 +2147,8 @@ func (m *Model) View() string {
 			return fmt.Sprintf("\n  %s\n\n  %s\n", errStyle.Render("Error: "+m.err.Error()), helpStyle.Render("[r]etry  [q]uit"))
 		}
 		footer := helpStyle.Render("[↑/↓] navigate  [/] search  [enter] open  [n] new  [d] delete  [a] agents  [t] terminals  [r] reload  [q] quit")
-		return "\n" + m.list.View() + "\n" + footer
+		terminalStatus := dimStyle.Render("Active terminal for Monya: " + m.activeTerminalName())
+		return "\n" + m.list.View() + "\n" + footer + "\n" + terminalStatus
 	case stateChat:
 		return m.viewChat()
 	case stateNewChat:
@@ -2131,7 +2171,7 @@ func (m *Model) View() string {
 	case stateTerminals:
 		var b strings.Builder
 		b.WriteString("\n" + m.list.View() + "\n")
-		b.WriteString(helpStyle.Render("[enter] open/select  [n] new  [d] close  [r] restart unavailable  [esc] chat"))
+		b.WriteString(helpStyle.Render("[s] select for Monya without opening  [enter] open  [n] new  [d] close  [r] restart unavailable  [esc] back"))
 		if m.terminalNotice != "" {
 			b.WriteString("\n" + errStyle.Render(m.terminalNotice))
 		}
@@ -2235,26 +2275,11 @@ func (m *Model) viewAgentEditor() string {
 func (m *Model) viewChat() string {
 	var b strings.Builder
 	b.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).Render(fmt.Sprintf("%s · %s", m.activeChat.Title, m.activeAgent.Name)))
-	thinkingBadge := lipgloss.NewStyle().Bold(true).Padding(0, 1)
-	if m.activeChat.Thinking {
-		thinkingBadge = thinkingBadge.Foreground(lipgloss.Color("0")).Background(lipgloss.Color("42"))
-		b.WriteString("  " + thinkingBadge.Render("THINKING ON"))
-	} else {
-		thinkingBadge = thinkingBadge.Foreground(lipgloss.Color("15")).Background(lipgloss.Color("160"))
-		b.WriteString("  " + thinkingBadge.Render("THINKING OFF"))
-	}
-	terminalName := "unavailable"
-	if entry := m.activeTerminal(); entry != nil {
-		terminalName = entry.name
-		if entry.starting {
-			terminalName += " (starting)"
-		} else if entry.err != "" {
-			terminalName += " (unavailable)"
-		}
-	}
-	b.WriteString("  " + lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39")).Render("TERMINAL: "+terminalName))
 	b.WriteString("\n\n")
 	b.WriteString(m.viewport.View())
+	b.WriteString("\n")
+
+	b.WriteString(m.chatStatusLine())
 	b.WriteString("\n")
 
 	if m.commandTimedOut {
@@ -2262,11 +2287,15 @@ func (m *Model) viewChat() string {
 		b.WriteString("\n")
 		b.WriteString(helpStyle.Render("[K]ill  [W]ait"))
 	} else if m.commandRunning {
+		terminalName := "unavailable"
+		if entry := m.terminalByID(m.commandTerminalID); entry != nil {
+			terminalName = entry.name
+		}
 		b.WriteString(dimStyle.Render("Command is running in " + terminalName + "; Enter sends input to the shell."))
 		b.WriteString("\n" + m.textarea.View())
 		b.WriteString("\n" + helpStyle.Render("[enter] send terminal input  [ctrl+j] newline  [ctrl+t] view terminal output"))
 	} else if m.pendingToolCall != nil {
-		b.WriteString(dimStyle.Render(fmt.Sprintf("Execute in %s: %s ?", terminalName, m.pendingCmd)))
+		b.WriteString(dimStyle.Render(fmt.Sprintf("Execute in %s: %s ?", m.activeTerminalName(), m.pendingCmd)))
 		b.WriteString("\n")
 		b.WriteString(helpStyle.Render("[enter/y]es  [n]o"))
 	} else if m.isStreaming {
@@ -2295,4 +2324,38 @@ func (m *Model) viewChat() string {
 		b.WriteString("\n" + errStyle.Render(m.terminalNotice))
 	}
 	return b.String()
+}
+
+func (m *Model) activeTerminalName() string {
+	entry := m.activeTerminal()
+	if entry == nil {
+		return "unavailable"
+	}
+	name := entry.name
+	if entry.starting {
+		name += " (starting)"
+	} else if entry.err != "" {
+		name += " (unavailable)"
+	}
+	return name
+}
+
+func (m *Model) chatStatusLine() string {
+	width := max(1, m.viewport.Width)
+	thinkingBadge := lipgloss.NewStyle().Bold(true).Padding(0, 1)
+	if m.activeChat.Thinking {
+		thinkingBadge = thinkingBadge.Foreground(lipgloss.Color("0")).Background(lipgloss.Color("42"))
+	} else {
+		thinkingBadge = thinkingBadge.Foreground(lipgloss.Color("15")).Background(lipgloss.Color("160"))
+	}
+	thinking := ansi.Wrap(thinkingBadge.Render("THINKING ON"), width, "")
+	if !m.activeChat.Thinking {
+		thinking = ansi.Wrap(thinkingBadge.Render("THINKING OFF"), width, "")
+	}
+	terminalBadge := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Background(lipgloss.Color("24"))
+	activeTerminal := ansi.Wrap(terminalBadge.Render("TERMINAL: "+m.activeTerminalName()), width, "")
+	if lipgloss.Width(thinking)+2+lipgloss.Width(activeTerminal) > width {
+		return thinking + "\n" + activeTerminal
+	}
+	return thinking + "  " + activeTerminal
 }

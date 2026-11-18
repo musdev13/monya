@@ -9,10 +9,12 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"monya/internal/api"
 	"monya/internal/config"
 	"monya/internal/store"
+	"monya/internal/terminal"
 )
 
 func TestWindowSizeClampsViewportForShortTerminal(t *testing.T) {
@@ -117,11 +119,104 @@ func TestChatViewShowsThinkingAndSelectedTerminal(t *testing.T) {
 			t.Fatalf("chat view does not show %q: %s", status, view)
 		}
 	}
+	m.isStreaming = true
+	view = m.viewChat()
+	for _, status := range []string{"THINKING ON", "TERMINAL: Terminal 1"} {
+		if !strings.Contains(view, status) {
+			t.Fatalf("streaming chat view does not show %q: %s", status, view)
+		}
+	}
 
+	m.isStreaming = false
 	m.activeChat.Thinking = false
 	view = m.viewChat()
 	if !strings.Contains(view, "THINKING OFF") {
 		t.Fatalf("chat view does not show thinking off: %s", view)
+	}
+}
+
+func TestChatStatusLineWrapsWithinNarrowWindow(t *testing.T) {
+	m := New(api.NewClient("", ""), config.Default())
+	m.activeChat.Thinking = true
+	m.terminals = []*terminalEntry{{id: "terminal-1", name: "Terminal 1"}}
+	m.activeTerminalID = "terminal-1"
+	_, _ = m.Update(tea.WindowSizeMsg{Width: 15, Height: 20})
+
+	for _, line := range strings.Split(m.chatStatusLine(), "\n") {
+		if width := lipgloss.Width(line); width > m.viewport.Width {
+			t.Fatalf("status line width %d exceeds viewport width %d: %q", width, m.viewport.Width, line)
+		}
+	}
+}
+
+func TestTerminalCanBeSelectedWithoutOpeningConsole(t *testing.T) {
+	session, err := terminal.Start()
+	if err != nil {
+		t.Fatalf("terminal.Start: %v", err)
+	}
+	defer session.Close()
+
+	m := New(api.NewClient("", ""), config.Default())
+	m.state = stateTerminals
+	m.terminalReturnState = stateChat
+	m.list.Title = "Monya — Terminals"
+	m.list.SetSize(80, 20)
+	_, _ = m.Update(tea.WindowSizeMsg{Width: 80, Height: 20})
+	m.terminals = []*terminalEntry{
+		{id: "terminal-1", name: "Terminal 1", session: session},
+		{id: "terminal-2", name: "Terminal 2", session: session},
+	}
+	m.activeTerminalID = "terminal-1"
+	m.list.SetItems(m.terminalListItems())
+	_, _ = m.updateTerminalList(tea.KeyMsg{Type: tea.KeyDown})
+
+	_, _ = m.updateTerminalList(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	if m.activeTerminalID != "terminal-2" {
+		t.Fatalf("active terminal = %q, want terminal-2", m.activeTerminalID)
+	}
+	if m.state != stateChat {
+		t.Fatalf("state = %v, want chat (selection should not open console)", m.state)
+	}
+	if status := m.chatStatusLine(); !strings.Contains(status, "TERMINAL: Terminal 2") {
+		t.Fatalf("selected terminal is not shown in chat status: %s", status)
+	}
+}
+
+func TestChatTextWrapsToViewportWidth(t *testing.T) {
+	m := New(api.NewClient("", ""), config.Default())
+	m.state = stateChat
+	m.history = []api.Message{{
+		Role:             "assistant",
+		ReasoningContent: strings.Repeat("reasoning words ", 8),
+		Content:          strings.Repeat("answer words ", 8),
+	}}
+	_, _ = m.Update(tea.WindowSizeMsg{Width: 24, Height: 20})
+	m.updateViewport()
+
+	for _, line := range strings.Split(m.viewport.View(), "\n") {
+		if width := lipgloss.Width(line); width > m.viewport.Width {
+			t.Fatalf("rendered line width %d exceeds viewport width %d: %q", width, m.viewport.Width, line)
+		}
+	}
+}
+
+func TestLongMarkdownAndCodeLinesWrapWithoutLosingText(t *testing.T) {
+	long := strings.Repeat("unbroken", 8)
+	rendered := renderMarkdown(long, 12)
+	for _, line := range strings.Split(strings.TrimSpace(rendered), "\n") {
+		if width := lipgloss.Width(line); width > 12 {
+			t.Fatalf("markdown line width %d exceeds 12: %q", width, line)
+		}
+	}
+
+	wrapped := wrapCodeLine(long, 7)
+	if strings.Join(wrapped, "") != long {
+		t.Fatalf("wrapped code changed content: %q", strings.Join(wrapped, ""))
+	}
+	for _, line := range wrapped {
+		if width := lipgloss.Width(line); width > 7 {
+			t.Fatalf("code line width %d exceeds 7: %q", width, line)
+		}
 	}
 }
 
